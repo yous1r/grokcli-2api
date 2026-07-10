@@ -93,6 +93,27 @@ OIDC_SCOPES = os.getenv(
     "openid profile email offline_access grok-cli:access api:access "
     "conversations:read conversations:write",
 )
+# Email-assisted account registration.
+XAI_ACCOUNTS_URL = os.getenv("GROK2API_XAI_ACCOUNTS_URL", "https://accounts.x.ai/")
+XAI_PROXY = (
+    os.getenv("GROK2API_XAI_PROXY")
+    or os.getenv("GROK2API_PROXY")
+    or ""
+).strip()
+XAI_PROXY_USERNAME = (
+    os.getenv("GROK2API_XAI_PROXY_USERNAME")
+    or os.getenv("GROK2API_PROXY_USERNAME")
+    or ""
+).strip()
+XAI_PROXY_PASSWORD = (
+    os.getenv("GROK2API_XAI_PROXY_PASSWORD")
+    or os.getenv("GROK2API_PROXY_PASSWORD")
+    or ""
+).strip()
+MOEMAIL_BASE_URL = os.getenv("GROK2API_MOEMAIL_BASE_URL", "https://moemail.521884.xyz")
+MOEMAIL_API_KEY = os.getenv("GROK2API_MOEMAIL_API_KEY", "")
+MOEMAIL_DOMAIN = os.getenv("GROK2API_MOEMAIL_DOMAIN", "lolicc.online")
+MOEMAIL_EXPIRY_MS = int(os.getenv("GROK2API_MOEMAIL_EXPIRY_MS", "3600000"))
 # Auto-refresh access tokens this many seconds before expiry
 TOKEN_REFRESH_SKEW = float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "120"))
 
@@ -146,4 +167,3 @@ MODEL_ALIASES: dict[str, str] = {
     "grok-build": "grok-build",
     "default": DEFAULT_MODEL,
 }
-

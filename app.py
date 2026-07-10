@@ -14,6 +14,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -787,7 +788,7 @@ async def _stream_proxy_with_failover(
                     if "text/event-stream" in ctype or "stream" in ctype:
                         async for line in resp.aiter_lines():
                             if await client_disconnected():
-                                break
+                                return
                             parsed = _parse_sse_line(line)
                             if parsed is None:
                                 continue
@@ -912,6 +913,8 @@ async def _stream_proxy_with_failover(
                     finish_reason="tool_calls" if saw_tool_calls else "stop",
                 )
             yield "data: [DONE]\n\n"
+            return
+        except asyncio.CancelledError:
             return
         except Exception as e:  # noqa: BLE001
             account_pool.report_failure(creds.auth_key, error=str(e), status_code=502)
@@ -1287,7 +1290,7 @@ async def _stream_anthropic_with_failover(
                     if "text/event-stream" in ctype or "stream" in ctype:
                         async for line in resp.aiter_lines():
                             if await client_disconnected():
-                                break
+                                return
                             parsed = _parse_sse_line(line)
                             if parsed is None:
                                 continue
@@ -1360,6 +1363,8 @@ async def _stream_anthropic_with_failover(
                     "tool_calls" if assembler._saw_tool else "stop"
                 ):
                     yield ev
+            return
+        except asyncio.CancelledError:
             return
         except Exception as e:  # noqa: BLE001
             account_pool.report_failure(

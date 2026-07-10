@@ -15,6 +15,7 @@ import account_pool
 import accounts
 import apikeys
 import conversation_affinity
+import email_registration
 import model_health
 import quota
 import token_maintainer
@@ -86,6 +87,29 @@ class ImportAuthBody(BaseModel):
         description="JWT string, single entry JSON, or full auth.json map"
     )
     merge: bool = Field(default=True, description="Merge into existing auth.json")
+
+
+class EmailRegistrationBody(BaseModel):
+    """Start email-assisted accounts.x.ai registration."""
+
+    provider: str = Field(default="moemail", pattern="^moemail$")
+    protocol: str = Field(default="grpc", pattern="^grpc$")
+    email: str | None = Field(default=None, max_length=256)
+    mailbox_id: str | None = Field(default=None, max_length=256)
+    prefix: str | None = Field(default=None, max_length=64)
+    domain: str | None = Field(default=None, max_length=128)
+    expiry_ms: int | None = Field(default=None, ge=60000, le=86400000)
+    api_key: str | None = Field(default=None, max_length=512)
+    base_url: str | None = Field(default=None, max_length=256)
+    proxy: str | None = Field(default=None, max_length=512)
+    proxy_username: str | None = Field(default=None, max_length=256)
+    proxy_password: str | None = Field(default=None, max_length=512)
+
+
+class EmailRegistrationProxyTestBody(BaseModel):
+    proxy: str | None = Field(default=None, max_length=512)
+    proxy_username: str | None = Field(default=None, max_length=256)
+    proxy_password: str | None = Field(default=None, max_length=512)
 
 
 class RefreshBody(BaseModel):
@@ -387,6 +411,95 @@ async def import_account(
     return result
 
 
+@router.post("/accounts/register-email")
+async def start_email_registration(
+    body: EmailRegistrationBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """
+    Start MoeMail-assisted accounts.x.ai registration.
+
+    The existing OIDC device poller imports the Grok token into auth.json after
+    the account finishes authorizing the device code.
+    """
+    require_admin(request, x_admin_token)
+    try:
+        result = email_registration.start_email_registration(
+            provider=body.provider,
+            protocol=body.protocol,
+            email=body.email,
+            mailbox_id=body.mailbox_id,
+            prefix=body.prefix,
+            domain=body.domain,
+            expiry_ms=body.expiry_ms,
+            api_key=body.api_key,
+            base_url=body.base_url,
+            proxy=body.proxy,
+            proxy_username=body.proxy_username,
+            proxy_password=body.proxy_password,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "start failed")
+    return result
+
+
+@router.post("/accounts/register-email/test-proxy")
+async def test_email_registration_proxy(
+    body: EmailRegistrationProxyTestBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return email_registration.test_xai_proxy(
+        proxy=body.proxy,
+        proxy_username=body.proxy_username,
+        proxy_password=body.proxy_password,
+    )
+
+
+@router.post("/register-email/test-proxy")
+async def test_email_registration_proxy_unscoped(
+    body: EmailRegistrationProxyTestBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return email_registration.test_xai_proxy(
+        proxy=body.proxy,
+        proxy_username=body.proxy_username,
+        proxy_password=body.proxy_password,
+    )
+
+
+@router.get("/accounts/register-email/sessions")
+async def list_email_registration_sessions(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return email_registration.list_registration_sessions()
+
+
+@router.get("/accounts/register-email/sessions/{session_id}")
+async def get_email_registration_session(
+    session_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    include_auth_json: int = 0,
+):
+    require_admin(request, x_admin_token)
+    result = email_registration.get_registration_session(
+        session_id,
+        include_auth_json=bool(include_auth_json),
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="registration session not found")
+    return result
+
+
 @router.post("/accounts/import-file")
 async def import_account_file(
     request: Request,
@@ -674,5 +787,3 @@ async def models_sync(
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("error") or "sync failed")
     return result
-
-

@@ -1,5 +1,13 @@
 # grokcli-2api
 
+## 本次更新
+
+- 补充 xAI 代理配置、连通性测试和邮箱注册会话管理接口。
+- 优化管理台交互，以及 OpenAI / Anthropic 流式请求在客户端断开时的处理。
+- 完善 Anthropic Messages 兼容转换和相关依赖配置。
+
+> **状态说明：注册机暂不可以使用。** 邮箱辅助注册（MoeMail 协议）当前暂不可用，请使用设备码登录或导入已有 `auth.json`；现有账号管理和 API 服务不受影响。
+
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、**多账号轮询**、设备码 / 导入授权。
 
 **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth。凭证保存在项目 `data/` 目录。

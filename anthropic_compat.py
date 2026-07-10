@@ -797,72 +797,63 @@ class AnthropicStreamAssembler:
                 except (TypeError, ValueError):
                     oi = 0
                 if oi not in self._tools:
-                    fn = raw.get("function") if isinstance(raw.get("function"), dict) else {}
-                    name = (fn or {}).get("name") or raw.get("name") or ""
                     tid = raw.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
                     bi = self._next_index
                     self._next_index += 1
                     self._tools[oi] = {
                         "block_index": bi,
                         "id": tid,
-                        "name": name,
+                        "name": "",
                         "args": "",
+                        "args_sent": 0,
                         "started": False,
                     }
-                    # If name not yet known, still start block when we have id/name
-                    if name or raw.get("id"):
-                        self._tools[oi]["started"] = True
-                        events.append(
-                            anthropic_stream_block_start_tool(
-                                bi, tool_id=tid, name=name or "tool"
-                            )
-                        )
                 state = self._tools[oi]
                 fn = raw.get("function") if isinstance(raw.get("function"), dict) else {}
                 if raw.get("id"):
                     state["id"] = raw["id"]
                 if (fn or {}).get("name"):
-                    # name may arrive after id in OpenAI streaming
-                    new_name = str(fn["name"])
-                    if not state["started"]:
-                        state["name"] = (state["name"] or "") + new_name
-                    elif not state["name"]:
-                        state["name"] = new_name
-                    else:
-                        # OpenAI sometimes streams name in pieces before start
-                        if not state.get("name_locked"):
-                            state["name"] = (state["name"] or "") + new_name
-                if not state["started"] and (state["name"] or state["id"]):
-                    state["started"] = True
-                    state["name_locked"] = True
-                    events.append(
-                        anthropic_stream_block_start_tool(
-                            state["block_index"],
-                            tool_id=state["id"],
-                            name=state["name"] or "tool",
-                        )
-                    )
+                    state["name"] = (state.get("name") or "") + str(fn["name"])
+                if raw.get("name"):
+                    state["name"] = (state.get("name") or "") + str(raw["name"])
+
                 args_piece = None
                 if isinstance(fn, dict) and fn.get("arguments") is not None:
                     args_piece = str(fn["arguments"])
                 elif raw.get("arguments") is not None:
                     args_piece = str(raw["arguments"])
                 if args_piece:
-                    if not state["started"]:
-                        state["started"] = True
-                        state["name_locked"] = True
+                    state["args"] += args_piece
+
+                if (
+                    not state["started"]
+                    and state.get("name")
+                    and args_piece is not None
+                ):
+                    state["started"] = True
+                    events.append(
+                        anthropic_stream_block_start_tool(
+                            state["block_index"],
+                            tool_id=state["id"],
+                            name=state["name"],
+                        )
+                    )
+                    if state["args"]:
                         events.append(
-                            anthropic_stream_block_start_tool(
-                                state["block_index"],
-                                tool_id=state["id"],
-                                name=state["name"] or "tool",
+                            anthropic_stream_input_json_delta(
+                                state["block_index"], state["args"]
                             )
                         )
-                    state["args"] += args_piece
+                        state["args_sent"] = len(state["args"])
+                        self._output_chars += len(state["args"])
+                elif state["started"] and args_piece:
                     events.append(
                         anthropic_stream_input_json_delta(
                             state["block_index"], args_piece
                         )
+                    )
+                    state["args_sent"] = int(state.get("args_sent") or 0) + len(
+                        args_piece
                     )
                     self._output_chars += len(args_piece)
 
@@ -875,6 +866,25 @@ class AnthropicStreamAssembler:
         events.extend(self._close_thinking())
         events.extend(self._close_text())
         for state in self._tools.values():
+            if not state.get("started"):
+                state["started"] = True
+                events.append(
+                    anthropic_stream_block_start_tool(
+                        state["block_index"],
+                        tool_id=state["id"],
+                        name=state.get("name") or "tool",
+                    )
+                )
+                if state.get("args"):
+                    sent = int(state.get("args_sent") or 0)
+                    remaining = state["args"][sent:]
+                    if remaining:
+                        events.append(
+                            anthropic_stream_input_json_delta(
+                                state["block_index"], remaining
+                            )
+                        )
+                        self._output_chars += len(remaining)
             if state.get("started"):
                 events.append(anthropic_stream_block_stop(state["block_index"]))
         stop = map_finish_to_stop_reason(
