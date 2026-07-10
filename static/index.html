@@ -567,7 +567,7 @@
       </div>
       <h2 id="boot-desc">正在连接本地服务…</h2>
       <p class="lead" id="boot-hint">
-        请用 <span class="mono">http://127.0.0.1:3000/admin</span> 访问（不要直接打开 HTML 文件）。
+        请通过服务地址访问管理台（不要直接打开 HTML 文件）。
       </p>
       <div class="actions">
         <span class="pill live">● connecting</span>
@@ -1181,11 +1181,27 @@ function buildMobileNav() {
   });
 }
 
+function currentOrigin() {
+  try {
+    if (location.protocol === "http:" || location.protocol === "https:") {
+      return location.origin;
+    }
+  } catch (_) {}
+  return "";
+}
+
+function currentAdminUrl() {
+  const origin = currentOrigin();
+  if (origin) return origin.replace(/\/$/, "") + "/admin";
+  const port = location.port || "3000";
+  return `http://<your-host>:${port}/admin`;
+}
+
 async function bootstrap() {
   if (location.protocol === "file:") {
     showBoot(
       "请通过服务打开管理台",
-      '不要直接双击 HTML。请运行 <span class="mono">./start.sh</span> 或 <span class="mono">python app.py</span>，然后访问 <span class="mono">http://127.0.0.1:3000/admin</span>。'
+      '不要直接双击 HTML。请运行 <span class="mono">./start.sh</span> 或 <span class="mono">python app.py</span>，然后在浏览器打开服务的 <span class="mono">/admin</span> 地址（公网部署请用你的域名或公网 IP）。'
     );
     toast("检测到 file:// 打开，无法连接 API", false);
     return;
@@ -1195,10 +1211,9 @@ async function bootstrap() {
   try {
     statusCache = await api("/status");
   } catch (e) {
-    const port = location.port || "3000";
     showBoot(
       "无法连接 grokcli-2api 服务",
-      `请先启动服务：<span class="mono">./start.sh</span> 或 <span class="mono">python app.py</span>，再打开 <span class="mono">http://127.0.0.1:${port}/admin</span>。<br><br>错误：${esc(e.message)}`
+      `请先启动服务：<span class="mono">./start.sh</span> 或 <span class="mono">python app.py</span>，再打开 <span class="mono">${esc(currentAdminUrl())}</span>。<br><br>错误：${esc(e.message)}`
     );
     toast("无法连接服务: " + e.message, false);
     return;
@@ -1714,8 +1729,16 @@ function startAutoUiRefresh() {
 }
 
 function renderGuide() {
-  const base = (dashCache && dashCache.api_base) || (statusCache && statusCache.api_base) || "http://127.0.0.1:3000/v1";
-  const origin = base.replace(/\/v1\/?$/, "") || "http://127.0.0.1:3000";
+  const pageOrigin = currentOrigin();
+  let base = (dashCache && dashCache.api_base) || (statusCache && statusCache.api_base) || "";
+  // Prefer current browser origin on public deployments so guides never show 127.0.0.1
+  // when the page itself was opened via domain/public IP.
+  if (pageOrigin && (!base || /127\.0\.0\.1|localhost/i.test(base))) {
+    base = pageOrigin.replace(/\/$/, "") + "/v1";
+  }
+  if (!base) base = "<your-host>/v1";
+  let origin = base.replace(/\/v1\/?$/, "");
+  if (!origin) origin = pageOrigin || "<your-host>";
   const model = (dashCache && dashCache.default_model) || (statusCache && statusCache.default_model) || "grok-4.5";
   $("guide-base").textContent = base;
   $("guide-model").textContent = model;

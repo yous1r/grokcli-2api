@@ -33,6 +33,7 @@ else:
 from config import (
     CLI_VERSION,
     DEFAULT_MODEL,
+    PUBLIC_BASE_URL,
     REQUIRE_API_KEY,
     UPSTREAM_BASE,
 )
@@ -201,8 +202,65 @@ def require_admin(
 # ── public (no session) ─────────────────────────────────────────────────────
 
 
+def _is_loopback_host(host: str | None) -> bool:
+    h = (host or "").strip().lower().strip("[]")
+    return h in {"", "127.0.0.1", "localhost", "0.0.0.0", "::", "::1"}
+
+
+def _request_public_origin(request: Request | None = None) -> str | None:
+    """Best-effort public origin for admin/UI links.
+
+    Priority:
+      1) GROK2API_PUBLIC_BASE_URL (explicit)
+      2) current request Host / X-Forwarded-* (public reverse-proxy friendly)
+    Never invent 127.0.0.1 when the request itself is non-loopback.
+    """
+    configured = (PUBLIC_BASE_URL or getattr(_config, "PUBLIC_BASE_URL", "") or "").strip()
+    if configured:
+        return configured.rstrip("/")
+
+    if request is None:
+        return None
+
+    xf_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    xf_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    host_header = (request.headers.get("host") or "").strip()
+    host = xf_host or host_header
+    if not host:
+        return None
+
+    # Drop default ports for cleaner links.
+    host_only = host
+    if host_only.endswith(":80") or host_only.endswith(":443"):
+        maybe = host_only.rsplit(":", 1)[0]
+        if maybe and "/" not in maybe:
+            # keep IPv6 bracket forms untouched if present
+            if not (maybe.startswith("[") and not host_only.startswith("[")):
+                host_only = maybe
+
+    scheme = xf_proto or (request.url.scheme or "http")
+    if scheme not in ("http", "https"):
+        scheme = "http"
+    return f"{scheme}://{host_only}".rstrip("/")
+
+
+def _public_api_base(request: Request | None = None) -> str:
+    origin = _request_public_origin(request)
+    if origin:
+        return f"{origin}/v1"
+
+    # Fallback only when no request context (startup / offline tools).
+    host = str(getattr(_config, "HOST", "") or "")
+    port = int(getattr(_config, "PORT", 3000) or 3000)
+    if _is_loopback_host(host) or host in ("0.0.0.0", "::"):
+        display = "127.0.0.1"
+    else:
+        display = host
+    return f"http://{display}:{port}/v1"
+
+
 @router.get("/status")
-async def admin_status():
+async def admin_status(request: Request):
     setup = is_setup_needed()
     account = accounts.account_status()
     key_stats = apikeys.stats()
@@ -218,7 +276,8 @@ async def admin_status():
 
     host = _config.HOST
     port = _config.PORT
-    base_host = "127.0.0.1" if host in ("0.0.0.0", "::", "localhost") else host
+    public_origin = _request_public_origin(request)
+    api_base = _public_api_base(request)
 
     # registration fingerprint — useful to detect stale Docker images
     reg_status: dict[str, Any] = {"available": False}
@@ -242,10 +301,11 @@ async def admin_status():
         "cli_version": CLI_VERSION,
         "host": host,
         "port": port,
+        "public_origin": public_origin,
         "upstream": UPSTREAM_BASE,
         "default_model": DEFAULT_MODEL,
         "require_api_key_mode": REQUIRE_API_KEY,
-        "api_base": f"http://{base_host}:{port}/v1",
+        "api_base": api_base,
         "credentials_ok": creds_ok,
         "credentials_email": creds_email,
         "account_mode": get_account_mode(),
@@ -324,7 +384,7 @@ async def dashboard(
         cred = {"error": str(e)}
     host = _config.HOST
     port = _config.PORT
-    base_host = "127.0.0.1" if host in ("0.0.0.0", "::", "localhost") else host
+    public_origin = _request_public_origin(request)
     return {
         "credentials": cred,
         "accounts": account,
@@ -334,7 +394,10 @@ async def dashboard(
         "account_modes": list(VALID_ACCOUNT_MODES),
         "models": load_models_from_cache(),
         "settings": get_public_settings(),
-        "api_base": f"http://{base_host}:{port}/v1",
+        "host": host,
+        "port": port,
+        "public_origin": public_origin,
+        "api_base": _public_api_base(request),
         "cli_version": CLI_VERSION,
         "upstream": UPSTREAM_BASE,
         "default_model": DEFAULT_MODEL,

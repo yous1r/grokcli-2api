@@ -49,7 +49,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.4"
+APP_VERSION = "1.8.5"
 
 
 def _on_startup() -> None:
@@ -1088,8 +1088,10 @@ async def root():
             "Admin /admin",
         ],
         "hint": (
-            "OpenAI base_url → http://127.0.0.1:3000/v1 · "
-            "Anthropic base_url → http://127.0.0.1:3000 (or /v1)"
+            "OpenAI base_url → <your-host>/v1 · "
+            "Anthropic base_url → <your-host> (or /v1). "
+            "Use the same host/port you open in the browser; "
+            "set GROK2API_PUBLIC_BASE_URL if behind reverse proxy."
         ),
     }
 
@@ -2208,7 +2210,11 @@ def _pick_listen_host() -> str:
 
 
 def _admin_url(host: str, port: int) -> str:
-    # Always use 127.0.0.1 for local links (avoids IPv6 localhost ::1 failures)
+    # Prefer explicit public URL for server deployments.
+    public = (getattr(_config, "PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+    if public:
+        return f"{public}/admin"
+    # Local console: use 127.0.0.1 for loopback binds (avoid IPv6 ::1 quirks).
     display = "127.0.0.1" if host in ("0.0.0.0", "::", "127.0.0.1", "localhost") else host
     return f"http://{display}:{port}/admin"
 
@@ -2273,13 +2279,24 @@ def main() -> None:
     _config.PORT = port
 
     admin = _admin_url(host, port)
-    base_host = "127.0.0.1" if host in ("0.0.0.0", "::", "localhost") else host
+    public = (getattr(_config, "PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+    if public:
+        link_base = public
+    elif host in ("0.0.0.0", "::", "127.0.0.1", "localhost"):
+        # Bind-all on a server: print both bind and local loopback convenience links.
+        link_base = f"http://127.0.0.1:{port}"
+    else:
+        link_base = f"http://{host}:{port}"
     print(f"grokcli-2api v{APP_VERSION} listening on http://{host}:{port}")
-    print(f"  OpenAI base_url:    http://{base_host}:{port}/v1")
-    print(f"  Anthropic messages: http://{base_host}:{port}/v1/messages")
+    print(f"  OpenAI base_url:    {link_base}/v1")
+    print(f"  Anthropic messages: {link_base}/v1/messages")
     print(f"  Admin console:      {admin}")
-    print(f"  Docs:               http://{base_host}:{port}/docs")
-    print(f"  Health:             http://{base_host}:{port}/health")
+    print(f"  Docs:               {link_base}/docs")
+    print(f"  Health:             {link_base}/health")
+    if public:
+        print(f"  Public base URL:    {public}")
+    elif host in ("0.0.0.0", "::"):
+        print("  Tip: set GROK2API_PUBLIC_BASE_URL=https://your.domain to avoid 127.0.0.1 links")
     print(f"  Upstream:           {UPSTREAM_BASE}")
     if port != PORT:
         print(f"  NOTE: port {PORT} busy, using {port} instead")

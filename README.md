@@ -348,6 +348,7 @@ else:
 |------|------|------|
 | `GROK2API_HOST` | `127.0.0.1` | 监听地址（服务器用 `0.0.0.0`） |
 | `GROK2API_PORT` | `3000` | 端口 |
+| `GROK2API_PUBLIC_BASE_URL` | 空 | 公网访问根地址（如 `https://api.example.com`）；管理台/接入指南优先用它，避免显示 127.0.0.1 |
 | `GROK2API_ADMIN_PASSWORD` | 空 | 管理台密码 |
 | `GROK2API_API_KEY` | 空 | 遗留单 Key |
 | `GROK2API_REQUIRE_API_KEY` | `auto` | `auto` / `1` / `0` |

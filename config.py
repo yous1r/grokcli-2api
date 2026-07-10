@@ -8,6 +8,15 @@ from pathlib import Path
 # Local server
 HOST = os.getenv("GROK2API_HOST", "127.0.0.1")
 PORT = int(os.getenv("GROK2API_PORT", "3000"))
+# Optional public origin for admin UI / API guide links on public deployments.
+# Example: https://api.example.com  or  http://1.2.3.4:40081
+# When unset, request Host/X-Forwarded-* headers are preferred over 127.0.0.1.
+PUBLIC_BASE_URL = (
+    os.getenv("GROK2API_PUBLIC_BASE_URL")
+    or os.getenv("GROK2API_PUBLIC_URL")
+    or os.getenv("PUBLIC_BASE_URL")
+    or ""
+).strip().rstrip("/")
 # Legacy single key (still accepted if set). Prefer managed keys in data/keys.json
 API_KEY = os.getenv("GROK2API_API_KEY", "")
 
