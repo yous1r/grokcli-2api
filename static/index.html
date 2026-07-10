@@ -810,6 +810,8 @@
               <button class="btn sm" id="btn-acc-select-page">全选本页</button>
               <button class="btn sm" id="btn-acc-select-all-filtered">全选筛选结果</button>
               <button class="btn sm" id="btn-acc-select-none">取消选择</button>
+              <button class="btn sm primary" id="btn-acc-renew-selected">续期所选</button>
+              <button class="btn sm" id="btn-acc-export-selected">导出所选</button>
               <button class="btn sm danger" id="btn-acc-delete-selected">删除所选</button>
             </div>
           </div>
@@ -1348,6 +1350,7 @@ function renderKeys() {
 
 function fmtQuotaCell(p, liveQuota) {
   const q = liveQuota || p.last_quota || null;
+  const poolDisabled = p.enabled === false || p.disabled_for_quota || !!(liveQuota && liveQuota.pool_disabled);
   if (!q) {
     return `<span class="muted">未查询</span>
       <div style="margin-top:4px"><button class="btn sm" data-act="quota-one" data-id="${esc(p.id || "")}">查询</button></div>`;
@@ -1357,9 +1360,11 @@ function fmtQuotaCell(p, liveQuota) {
   }
   const exhausted = q.exhausted || p.disabled_for_quota;
   const summary = (q.display && q.display.summary) || q.summary || "—";
-  const pill = exhausted
-    ? '<span class="pill bad">额度耗尽</span>'
-    : (q.unlimited_or_free ? '<span class="pill ok">免费/促销</span>' : '<span class="pill ok">有额度</span>');
+  let pill;
+  if (exhausted) pill = '<span class="pill bad">额度耗尽</span>';
+  else if (poolDisabled) pill = '<span class="pill warn">禁用·不计入汇总</span>';
+  else if (q.unlimited_or_free) pill = '<span class="pill ok">免费/促销</span>';
+  else pill = '<span class="pill ok">有额度</span>';
   const detail = exhausted && p.disabled_reason
     ? `<div class="muted" style="font-size:0.72rem;margin-top:4px">${esc(p.disabled_reason)}</div>`
     : `<div class="muted" style="font-size:0.72rem;margin-top:4px">${esc(summary)}</div>`;
@@ -1459,6 +1464,7 @@ function renderAccountsPage() {
         <div style="margin-top:4px">${remPill} ${refreshPill}</div>
       </td>
       <td class="actions">
+        <button class="btn sm" data-act="renew-one" data-id="${esc(a.id)}" ${a.has_refresh_token ? "" : "disabled title=\"无 refresh_token，无法续期\""}>续期</button>
         <button class="btn sm" data-act="probe-one" data-id="${esc(a.id)}">模型测试</button>
         <button class="btn sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
         <button class="btn sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
@@ -1531,6 +1537,73 @@ async function deleteSelectedAccounts() {
   }
 }
 
+async function renewAccounts(ids, { confirmMany = true } = {}) {
+  const list = Array.from(new Set((ids || []).map(x => String(x || "").trim()).filter(Boolean)));
+  if (!list.length) {
+    toast("请先选择要续期的账号", false);
+    return;
+  }
+  if (confirmMany && list.length > 1) {
+    if (!confirm(`确认续期选中的 ${list.length} 个账号？将调用 refresh_token 更新 access token。`)) return;
+  }
+  try {
+    const r = await api("/accounts/refresh", {
+      method: "POST",
+      body: JSON.stringify({ force: true, ids: list }),
+    });
+    const n = r.refreshed ?? (r.results || []).filter(x => x.ok && !x.skipped).length;
+    const failed = (r.results || []).filter(x => !x.ok).length;
+    const skipped = (r.results || []).filter(x => x.ok && x.skipped).length;
+    let msg = `续期完成：成功 ${n}`;
+    if (failed) msg += `，失败 ${failed}`;
+    if (skipped) msg += `，跳过 ${skipped}`;
+    toast(msg, failed === 0);
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
+async function exportSelectedAccounts() {
+  const ids = Array.from(selectedAccountIds);
+  if (!ids.length) {
+    toast("请先勾选要导出的账号", false);
+    return;
+  }
+  try {
+    const res = await fetch("/admin/api/accounts/export-batch?download=1", {
+      method: "POST",
+      headers: headers(true),
+      body: JSON.stringify({ ids, include_secrets: true }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try {
+        const d = await res.json();
+        msg = d.detail || d.error || msg;
+      } catch {}
+      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    let filename = `grok2api-auth-export-selected-${ids.length}.json`;
+    const m = /filename=\"?([^\";]+)\"?/.exec(cd);
+    if (m) filename = m[1];
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast(`已导出选中 ${ids.length} 个账号`);
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
 $("acc-page-prev").onclick = () => { if (accountsPage > 1) { accountsPage--; renderAccountsPage(); } };
 $("acc-page-next").onclick = () => { accountsPage++; renderAccountsPage(); };
 $("acc-page-size").onchange = () => {
@@ -1556,6 +1629,8 @@ if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => {
   renderAccountsPage();
 };
 if ($("btn-acc-delete-selected")) $("btn-acc-delete-selected").onclick = () => deleteSelectedAccounts();
+if ($("btn-acc-renew-selected")) $("btn-acc-renew-selected").onclick = () => renewAccounts(Array.from(selectedAccountIds));
+if ($("btn-acc-export-selected")) $("btn-acc-export-selected").onclick = () => exportSelectedAccounts();
 if ($("acc-check-page")) {
   $("acc-check-page").onchange = (e) => setPageSelection(!!e.target.checked);
 }
@@ -1590,9 +1665,22 @@ async function refreshAllQuota(showToast = true) {
     });
     const qs = $("quota-summary");
     if (qs) {
+      const used = data.total_used != null ? Number(data.total_used) : null;
+      const limit = data.total_monthly_limit != null ? Number(data.total_monthly_limit) : null;
+      const remaining = data.total_remaining != null
+        ? Number(data.total_remaining)
+        : (used != null && limit != null ? Math.max(0, limit - used) : null);
+      const fmtUsd = (v) => {
+        if (v == null || Number.isNaN(v)) return "—";
+        return "$" + Number(v).toFixed(2);
+      };
       const parts = [
-        `已查询 ${data.ok_count ?? 0}/${data.count ?? 0}`,
+        `可用账号 ${data.active_ok_count ?? 0}/${data.count ?? 0}`,
+        remaining != null || limit != null
+          ? `可用额度 ${fmtUsd(remaining)} / ${fmtUsd(limit)}`
+          : null,
         data.exhausted_count ? `耗尽 ${data.exhausted_count}` : null,
+        data.pool_disabled_count ? `禁用不计入 ${data.pool_disabled_count}` : null,
         data.auto_disabled_count ? `已自动移出轮询 ${data.auto_disabled_count}` : null,
       ].filter(Boolean);
       qs.textContent = "额度汇总：" + parts.join(" · ");
@@ -2118,6 +2206,10 @@ $("accounts-tbody").onclick = async (e) => {
   if (!btn) return;
   const id = btn.dataset.id;
   try {
+    if (btn.dataset.act === "renew-one") {
+      await renewAccounts([id], { confirmMany: false });
+      return;
+    }
     if (btn.dataset.act === "probe-one") {
       await runAccountProbe(id);
       return;

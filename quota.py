@@ -461,16 +461,45 @@ async def fetch_all_quotas(
                     "fetched_at": time.time(),
                 })
 
+    # Mark results that belong to disabled rotation accounts so UI/stats can
+    # exclude them from available-quota aggregates.
+    disabled_ids: set[str] = set()
+    try:
+        import account_pool
+
+        for a in account_pool.list_pool_accounts():
+            if a.get("enabled") is False or a.get("disabled_for_quota"):
+                if a.get("id"):
+                    disabled_ids.add(str(a["id"]))
+    except Exception:
+        disabled_ids = set()
+
+    for r in results:
+        aid = r.get("account_id")
+        r["pool_disabled"] = bool(aid and str(aid) in disabled_ids)
+
     ok_count = sum(1 for r in results if r.get("ok"))
     exhausted_count = sum(1 for r in results if r.get("exhausted"))
     auto_disabled = sum(1 for r in results if r.get("auto_disabled"))
+    pool_disabled_count = sum(1 for r in results if r.get("pool_disabled"))
+    # Available totals exclude manually/quota-disabled accounts.
+    active_ok = [
+        r
+        for r in results
+        if r.get("ok") and not r.get("pool_disabled") and not r.get("exhausted")
+    ]
     total_used = sum(
-        float(r["used"]) for r in results if r.get("ok") and r.get("used") is not None
+        float(r["used"]) for r in active_ok if r.get("used") is not None
     )
     total_limit = sum(
         float(r["monthly_limit"])
-        for r in results
-        if r.get("ok") and r.get("monthly_limit") is not None
+        for r in active_ok
+        if r.get("monthly_limit") is not None
+    )
+    total_remaining = sum(
+        float(r["remaining"])
+        for r in active_ok
+        if r.get("remaining") is not None
     )
     return {
         "ok": True,
@@ -479,7 +508,10 @@ async def fetch_all_quotas(
         "ok_count": ok_count,
         "exhausted_count": exhausted_count,
         "auto_disabled_count": auto_disabled,
+        "pool_disabled_count": pool_disabled_count,
+        "active_ok_count": len(active_ok),
         "total_used": total_used,
         "total_monthly_limit": total_limit,
+        "total_remaining": total_remaining,
         "accounts": results,
     }

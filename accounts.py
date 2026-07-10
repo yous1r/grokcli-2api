@@ -300,20 +300,44 @@ def _normalize_entry(
     return aid, entry
 
 
-def export_auth_payload(*, include_secrets: bool = True) -> dict[str, Any]:
+def export_auth_payload(
+    *,
+    include_secrets: bool = True,
+    account_ids: list[str] | None = None,
+) -> dict[str, Any]:
     """
     Export auth.json map for download/backup.
     include_secrets=True returns full tokens (needed for re-import).
+    account_ids=None exports all accounts; otherwise only selected ids.
     """
     data = read_auth_map()
+    wanted: set[str] | None = None
+    if account_ids is not None:
+        wanted = {str(x).strip() for x in account_ids if str(x).strip()}
+        if not wanted:
+            return {
+                "ok": True,
+                "auth": {},
+                "count": 0,
+                "auth_file": str(AUTH_FILE),
+                "exported_at": time.time(),
+                "selected": 0,
+                "missing": [],
+            }
+        data = {k: v for k, v in data.items() if k in wanted}
+
     if not data:
-        return {
+        out_empty = {
             "ok": True,
             "auth": {},
             "count": 0,
             "auth_file": str(AUTH_FILE),
             "exported_at": time.time(),
         }
+        if wanted is not None:
+            out_empty["selected"] = len(wanted)
+            out_empty["missing"] = sorted(wanted)
+        return out_empty
     if include_secrets:
         out = {k: dict(v) if isinstance(v, dict) else v for k, v in data.items()}
     else:
@@ -337,13 +361,17 @@ def export_auth_payload(*, include_secrets: bool = True) -> dict[str, Any]:
                 safe["token_hint"] = _mask_token(tok)
             safe["has_refresh_token"] = bool(v.get("refresh_token"))
             out[k] = safe
-    return {
+    result = {
         "ok": True,
         "auth": out,
         "count": len(out),
         "auth_file": str(AUTH_FILE),
         "exported_at": time.time(),
     }
+    if wanted is not None:
+        result["selected"] = len(wanted)
+        result["missing"] = sorted(wanted - set(out.keys()))
+    return result
 
 
 def import_auth_payload(
@@ -541,16 +569,22 @@ def import_auth_payload(
     }
 
 
-def do_refresh_all(*, force: bool = True) -> dict[str, Any]:
+def do_refresh_all(
+    *,
+    force: bool = True,
+    account_ids: list[str] | None = None,
+) -> dict[str, Any]:
     """
     Refresh accounts that have refresh_token.
     force=True: refresh all; force=False: only near-expiry.
+    account_ids: optional subset to renew (single / multi-select).
     """
     from config import TOKEN_REFRESH_SKEW
 
     result = refresh_all_accounts(
         only_near_expiry=not force,
         skew_seconds=max(300.0, float(TOKEN_REFRESH_SKEW) * 2),
+        account_ids=account_ids,
     )
     now = time.time()
     for r in result.get("results") or []:
@@ -559,6 +593,8 @@ def do_refresh_all(*, force: bool = True) -> dict[str, Any]:
             r["remaining_sec"] = max(0, int(float(exp) - now))
     result["accounts"] = list_accounts()
     result["force"] = force
+    if account_ids is not None:
+        result["requested_ids"] = [str(x).strip() for x in account_ids if str(x).strip()]
     try:
         import token_maintainer
 

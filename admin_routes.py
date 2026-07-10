@@ -163,6 +163,19 @@ class RefreshBody(BaseModel):
         default=True,
         description="True = refresh all tokens; False = only near-expiry",
     )
+    ids: list[str] = Field(
+        default_factory=list,
+        max_length=2000,
+        description="Optional account ids to renew; empty = all accounts",
+    )
+
+
+class AccountBulkExportBody(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=2000)
+    include_secrets: bool = Field(
+        default=True,
+        description="Include access/refresh tokens (required for re-import)",
+    )
 
 
 class AccountProbeBody(BaseModel):
@@ -853,6 +866,38 @@ async def import_account_file(
     return result
 
 
+def _export_response(
+    result: dict[str, Any],
+    *,
+    download: bool,
+    filename_prefix: str = "grok2api-auth-export",
+) -> Response:
+    payload = {
+        "exported_at": result.get("exported_at") or time.time(),
+        "source": "grokcli-2api",
+        "count": result.get("count", 0),
+        "auth": result.get("auth") or {},
+    }
+    if result.get("selected") is not None:
+        payload["selected"] = result.get("selected")
+    if result.get("missing") is not None:
+        payload["missing"] = result.get("missing")
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    if not download:
+        return JSONResponse(content=payload)
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    count = int(result.get("count") or 0)
+    filename = f"{filename_prefix}-{count}-{ts}.json"
+    return Response(
+        content=body.encode("utf-8"),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.get("/accounts/export")
 async def export_accounts(
     request: Request,
@@ -865,26 +910,34 @@ async def export_accounts(
     """
     require_admin(request, x_admin_token)
     result = accounts.export_auth_payload(include_secrets=True)
-    # Prefer plain auth map for re-import compatibility; wrap with meta
-    payload = {
-        "exported_at": result.get("exported_at") or time.time(),
-        "source": "grokcli-2api",
-        "count": result.get("count", 0),
-        "auth": result.get("auth") or {},
-    }
-    body = json.dumps(payload, ensure_ascii=False, indent=2)
-    if download:
-        ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        filename = f"grok2api-auth-export-{ts}.json"
-        return Response(
-            content=body.encode("utf-8"),
-            media_type="application/json; charset=utf-8",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Cache-Control": "no-store",
-            },
-        )
-    return JSONResponse(content=payload)
+    return _export_response(result, download=bool(download))
+
+
+@router.post("/accounts/export-batch")
+async def export_accounts_batch(
+    body: AccountBulkExportBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    download: int = 1,
+):
+    """Export selected accounts only (multi-select)."""
+    require_admin(request, x_admin_token)
+    ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+    if len(ids) > 2000:
+        raise HTTPException(status_code=400, detail="too many ids (max 2000)")
+    result = accounts.export_auth_payload(
+        include_secrets=bool(body.include_secrets),
+        account_ids=ids,
+    )
+    if not result.get("count"):
+        raise HTTPException(status_code=404, detail="no matching accounts to export")
+    return _export_response(
+        result,
+        download=bool(download),
+        filename_prefix="grok2api-auth-export-selected",
+    )
 
 
 @router.post("/accounts/logout")
@@ -1046,10 +1099,18 @@ async def refresh_accounts(
     """
     Refresh access tokens via refresh_token and update expires_at.
     force=true (default) refreshes all accounts with a refresh_token.
+    Pass body.ids to renew only selected accounts.
     """
     require_admin(request, x_admin_token)
     force = True if body is None else bool(body.force)
-    result = accounts.do_refresh_all(force=force)
+    ids = None
+    if body is not None and body.ids:
+        ids = [str(x).strip() for x in body.ids if str(x).strip()]
+        if not ids:
+            raise HTTPException(status_code=400, detail="ids is empty")
+        if len(ids) > 2000:
+            raise HTTPException(status_code=400, detail="too many ids (max 2000)")
+    result = accounts.do_refresh_all(force=force, account_ids=ids)
     # also kick background maintainer
     try:
         token_maintainer.request_run_soon()

@@ -651,6 +651,7 @@ def refresh_all_accounts(
     skew_seconds: float = 300.0,
     max_workers: int | None = None,
     max_accounts: int | None = None,
+    account_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Refresh accounts that have refresh_token (optionally only near expiry).
@@ -660,6 +661,7 @@ def refresh_all_accounts(
       - shared httpx client per worker (no 1-client-per-request storm)
       - single batched auth.json write at the end (not one rewrite per account)
       - optional max_accounts cap so a cycle never tries all 700 at once
+      - optional account_ids to refresh only selected accounts
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -672,15 +674,32 @@ def refresh_all_accounts(
     if max_workers is None:
         max_workers = TOKEN_REFRESH_WORKERS
     if max_accounts is None:
-        max_accounts = TOKEN_REFRESH_BATCH
+        # Selected-account renew should not be silently truncated by the
+        # background batch cap used for full-pool maintenance.
+        max_accounts = None if account_ids else TOKEN_REFRESH_BATCH
 
     data = read_auth_map()
     results: list[dict[str, Any]] = []
     candidates: list[tuple[str, dict[str, Any]]] = []
     now = time.time()
+    wanted: set[str] | None = None
+    if account_ids is not None:
+        wanted = {str(x).strip() for x in account_ids if str(x).strip()}
+        if not wanted:
+            return {
+                "ok": True,
+                "results": [],
+                "refreshed": 0,
+                "deferred": 0,
+                "attempted": 0,
+                "workers": 0,
+                "selected": 0,
+            }
 
     for aid, entry in list(data.items()):
         if not isinstance(entry, dict):
+            continue
+        if wanted is not None and aid not in wanted:
             continue
         if not entry.get("refresh_token"):
             results.append({"id": aid, "ok": False, "error": "no refresh_token"})
@@ -695,6 +714,11 @@ def refresh_all_accounts(
             )
             continue
         candidates.append((aid, entry))
+
+    if wanted is not None:
+        existing = set(data.keys())
+        for missing in sorted(wanted - existing):
+            results.append({"id": missing, "ok": False, "error": "account_not_found"})
 
     # Prefer soonest-expiring accounts first when batch-capped
     def _exp_key(item: tuple[str, dict[str, Any]]) -> float:
@@ -792,7 +816,7 @@ def refresh_all_accounts(
                 "attempted": len(candidates),
             }
 
-    return {
+    out = {
         "ok": True,
         "results": results,
         "refreshed": sum(1 for r in results if r.get("ok") and not r.get("skipped")),
@@ -800,3 +824,6 @@ def refresh_all_accounts(
         "attempted": len(candidates),
         "workers": workers,
     }
+    if wanted is not None:
+        out["selected"] = len(wanted)
+    return out
