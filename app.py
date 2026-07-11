@@ -2190,9 +2190,72 @@ def _pick_listen_host() -> str:
     return HOST or "127.0.0.1"
 
 
+def _detect_public_base_url(port: int) -> str | None:
+    """Best-effort public origin when GROK2API_PUBLIC_BASE_URL is unset.
+
+    Uses the host's outbound/default route IP so Docker/server banners show a
+    reachable address without hardcoding a domain. Admin/UI still prefer the
+    live request Host / X-Forwarded-* headers on each call.
+    """
+    import socket
+
+    candidates: list[str] = []
+    # UDP "connect" does not send packets; it reveals the preferred source IP.
+    for family, probe in (
+        (socket.AF_INET, ("1.1.1.1", 80)),
+        (socket.AF_INET6, ("2606:4700:4700::1111", 80)),
+    ):
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as s:
+                s.connect(probe)
+                ip = s.getsockname()[0]
+        except OSError:
+            continue
+        if not ip or ip.startswith("127.") or ip in ("::1",):
+            continue
+        # Skip typical Docker/bridge private ranges only when an explicit
+        # public-looking address is also available later; still usable fallback.
+        candidates.append(ip)
+
+    if not candidates:
+        try:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None):
+                ip = info[4][0]
+                if ip and not ip.startswith("127.") and ip not in ("::1",):
+                    candidates.append(ip)
+        except OSError:
+            pass
+
+    # Prefer global-looking IPv4, then any non-loopback.
+    def _score(ip: str) -> tuple[int, int]:
+        private = (
+            ip.startswith("10.")
+            or ip.startswith("192.168.")
+            or ip.startswith("172.")
+            and any(ip.startswith(f"172.{n}.") for n in range(16, 32))
+            or ip.startswith("fc")
+            or ip.startswith("fd")
+            or ip.startswith("fe80:")
+        )
+        v4 = 0 if ":" not in ip else 1
+        return (1 if private else 0, v4)
+
+    if not candidates:
+        return None
+    ip = sorted(set(candidates), key=_score)[0]
+    host = f"[{ip}]" if ":" in ip else ip
+    # Omit default http port for cleaner links.
+    if int(port) == 80:
+        return f"http://{host}"
+    return f"http://{host}:{int(port)}"
+
+
 def _admin_url(host: str, port: int) -> str:
     # Prefer explicit public URL for server deployments.
     public = (getattr(_config, "PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+    if not public:
+        public = _detect_public_base_url(port) or ""
     if public:
         return f"{public}/admin"
     # Local console: use 127.0.0.1 for loopback binds (avoid IPv6 ::1 quirks).
@@ -2259,8 +2322,12 @@ def main() -> None:
     _config.HOST = host
     _config.PORT = port
 
+    configured_public = (
+        getattr(_config, "PUBLIC_BASE_URL", "") or ""
+    ).strip().rstrip("/")
+    detected_public = None if configured_public else _detect_public_base_url(port)
+    public = configured_public or detected_public or ""
     admin = _admin_url(host, port)
-    public = (getattr(_config, "PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
     if public:
         link_base = public
     elif host in ("0.0.0.0", "::", "127.0.0.1", "localhost"):
@@ -2274,10 +2341,13 @@ def main() -> None:
     print(f"  Admin console:      {admin}")
     print(f"  Docs:               {link_base}/docs")
     print(f"  Health:             {link_base}/health")
-    if public:
-        print(f"  Public base URL:    {public}")
+    if configured_public:
+        print(f"  Public base URL:    {configured_public} (configured)")
+    elif detected_public:
+        print(f"  Public base URL:    {detected_public} (auto-detected)")
+        print("  Admin/API links also follow request Host / X-Forwarded-* headers")
     elif host in ("0.0.0.0", "::"):
-        print("  Tip: set GROK2API_PUBLIC_BASE_URL=https://your.domain to avoid 127.0.0.1 links")
+        print("  Tip: set GROK2API_PUBLIC_BASE_URL=https://your.domain if auto-detect is wrong")
     print(f"  Upstream:           {UPSTREAM_BASE}")
     if port != PORT:
         print(f"  NOTE: port {PORT} busy, using {port} instead")

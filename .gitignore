@@ -22,3 +22,4 @@ data/register_sso/
 
 # Local deploy overrides (ports, domains, secrets paths)
 docker-compose.override.yml
+grokcli-2api.env

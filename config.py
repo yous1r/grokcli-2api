@@ -9,8 +9,10 @@ from pathlib import Path
 HOST = os.getenv("GROK2API_HOST", "127.0.0.1")
 PORT = int(os.getenv("GROK2API_PORT", "3000"))
 # Optional public origin for admin UI / API guide links on public deployments.
-# Example: https://api.example.com  or  http://1.2.3.4:40081
-# When unset, request Host/X-Forwarded-* headers are preferred over 127.0.0.1.
+# Leave empty to auto-detect:
+#   - admin/API responses use request Host / X-Forwarded-* first
+#   - startup banner may fall back to the host's outbound/public IP
+# Explicit override still works: https://api.example.com  or  http://1.2.3.4:40081
 PUBLIC_BASE_URL = (
     os.getenv("GROK2API_PUBLIC_BASE_URL")
     or os.getenv("GROK2API_PUBLIC_URL")
