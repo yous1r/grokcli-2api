@@ -2,7 +2,7 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.8.13**
+**当前版本：v1.8.18**
 
 - **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth
 - **协议注册**：内置 `grok-build-auth`（HTTP 协议，无需 Chromium）
@@ -14,14 +14,26 @@
 
 ---
 
-## 本次更新（v1.8.13）
+## 本次更新（v1.8.18）
 
 | 方向 | 内容 |
 |------|------|
-| 修复 | 二次反代下 tool arguments 仍可能损坏 Claude Code `Read`（`file_path` 缺失） |
-| 根因 | 1.8.12 只修了内部累积；OpenAI 流仍把 cumulative 重发原样转出，客户端 naive-append 拼坏 JSON |
-| 处理 | 出站 tool args 只发未发送后缀；完整 JSON 快照延后到 finish 再 flush；单包 `}{` 双份 JSON 入口清洗 |
-| 覆盖 | OpenAI `/v1/chat/completions` 流 + Anthropic `/v1/messages` 流 + finalize/parse |
+| 修复 | Claude Code / sub2api 仍报 `apiError: Content block not found`（Grok 先 reasoning 再 tool） |
+| 根因 | 请求含 tools 时上游常先流式吐 `reasoning_content`；sub2api 将其开成 `content_block 0`，随后 `tool_calls[index=0]` 再映射到同一 index → Claude Code 找不到对应 tool block |
+| 处理 | OpenAI 出站：`tools` 请求下 **缓冲** pre-tool 的 content/reasoning；一旦出现 tool_calls **丢弃**前言只出工具帧；无工具则在 finish 前再冲刷缓冲。保留 v1.8.17 的 args 完整判定 / 升序出站 |
+| 覆盖 | OpenAI `/v1/chat/completions` 流（sub2api 主路径） |
+
+### 历史（v1.8.17）
+
+| 方向 | 内容 |
+|------|------|
+| 修复 | 真 delta JSON 标量 `"file_path"` 误判完整；高 index 抢占 content_block 0 |
+
+### 历史（v1.8.16）
+
+| 方向 | 内容 |
+|------|------|
+| 修复 | name-only 预占 index、content/tool 混帧、完整 JSON 原子出站 |
 
 ### 相关环境变量（可选）
 

@@ -534,6 +534,28 @@ def is_complete_json_text(s: str) -> bool:
         return False
 
 
+def is_complete_tool_arguments_json(s: str) -> bool:
+    """True when s is complete tool `function.arguments` for streaming gates.
+
+    OpenAI true-delta streams often emit intermediate JSON *scalars* such as
+    `"file_path"` while building `{"file_path":"..."}`. `json.loads` accepts
+    those scalars, but emitting them early opens the wrong content_block and
+    later yields Claude Code / sub2api: "Content block not found".
+
+    Require a complete JSON *object* or *array* for first emission / readiness.
+    """
+    if not s or not str(s).strip():
+        return False
+    text = str(s).strip()
+    if text[0] not in "{[":
+        return False
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed, (dict, list))
+
+
 def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
     """Parse tool arguments; recover doubled JSON from secondary relays."""
     if raw is None:
@@ -888,6 +910,10 @@ def merge_tool_argument_delta(current: str, incoming: str) -> str:
 
     Secondary relays may re-broadcast the full arguments JSON; naive append
     corrupts Claude Code tools (Read requires file_path, etc.).
+
+    Incomplete buffer + later complete non-prefix rewrite is common
+    (`{"file_path":` then `{"file_path" : "/x"}`). Prefer the complete value
+    instead of concatenating into invalid JSON.
     """
     cur = sanitize_tool_arguments_json(current) if current else ""
     piece = sanitize_tool_arguments_json(incoming) if incoming else ""
@@ -901,6 +927,26 @@ def merge_tool_argument_delta(current: str, incoming: str) -> str:
         return piece
     if cur.startswith(piece):
         return cur
+
+    # Prefer object/array completeness for tool args. Intermediate scalars such
+    # as `"file_path"` are complete JSON but not complete tool arguments.
+    cur_complete = is_complete_tool_arguments_json(cur)
+    piece_complete = is_complete_tool_arguments_json(piece)
+    cur_any = is_complete_json_text(cur)
+    piece_any = is_complete_json_text(piece)
+
+    # Incomplete → complete rewrite (spacing / key order / full resend).
+    if piece_complete and not cur_complete:
+        return piece
+    # Complete object/array → refuse trailing junk or second incomplete fragment.
+    if cur_complete and not piece_complete:
+        return cur
+    # If cur is only a scalar fragment and piece continues the real object,
+    # fall through to append / structural merge below.
+    if cur_any and not cur_complete and piece_any and not piece_complete:
+        # both scalar-ish complete JSON fragments — usually not a rewrite
+        pass
+
     try:
         a = json.loads(cur)
         b = json.loads(piece)
@@ -915,12 +961,7 @@ def merge_tool_argument_delta(current: str, incoming: str) -> str:
             return piece
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
-    # cur already complete — refuse trailing junk (`}` / second blob)
-    try:
-        json.loads(cur)
-        return cur
-    except (TypeError, ValueError, json.JSONDecodeError):
-        pass
+    # Both incomplete / non-JSON: only append when it looks like a true delta.
     return cur + piece
 
 
@@ -988,6 +1029,66 @@ class AnthropicStreamAssembler:
             return ""
         return sanitize_tool_arguments_json(raw)
 
+    def _flush_tool_args(self, state: dict[str, Any]) -> list[str]:
+        """Emit any not-yet-sent tool args (complete preferred; raw fallback)."""
+        events: list[str] = []
+        if not state.get("started"):
+            return events
+        args = state.get("args") or ""
+        sent_text = state.get("args_sent_text") or ""
+        if not args:
+            return events
+        if sent_text and not args.startswith(sent_text):
+            return events
+        remaining = args[len(sent_text) :]
+        if not remaining:
+            return events
+        # Prefer holding incomplete live fragments; only force-send when closing.
+        if not is_complete_tool_arguments_json(args) and not state.get("_closing"):
+            return events
+        events.append(
+            anthropic_stream_input_json_delta(state["block_index"], remaining)
+        )
+        state["args_sent_text"] = sent_text + remaining
+        state["args_sent"] = len(state["args_sent_text"])
+        self._output_chars += len(remaining)
+        return events
+
+    def _close_tools(self) -> list[str]:
+        """Stop all open tool_use blocks (flush args first)."""
+        events: list[str] = []
+        # Close in ascending content_block index order (not OpenAI tool index).
+        open_states = [
+            state
+            for state in self._tools.values()
+            if state.get("started") and not state.get("stopped")
+        ]
+        open_states.sort(
+            key=lambda s: (
+                s["block_index"]
+                if isinstance(s.get("block_index"), int)
+                else 10**9
+            )
+        )
+        for state in open_states:
+            if state.get("block_index") is None:
+                state["block_index"] = self._next_index
+                self._next_index += 1
+            state["_closing"] = True
+            events.extend(self._flush_tool_args(state))
+            if not (state.get("args_sent_text") or "").strip():
+                events.append(
+                    anthropic_stream_input_json_delta(state["block_index"], "{}")
+                )
+                state["args"] = state.get("args") or "{}"
+                state["args_sent_text"] = "{}"
+                state["args_sent"] = 2
+                self._output_chars += 2
+            events.append(anthropic_stream_block_stop(state["block_index"]))
+            state["stopped"] = True
+            state.pop("_closing", None)
+        return events
+
     def feed(
         self,
         *,
@@ -1000,6 +1101,9 @@ class AnthropicStreamAssembler:
             events.extend(self.start())
 
         if reasoning:
+            # Never leave tool_use open across thinking/text — converters and
+            # Claude Code expect stop before a new block type.
+            events.extend(self._close_tools())
             if self._thinking_index is None:
                 # close text before thinking if any (order: thinking then text usually)
                 # Keep open text; Anthropic allows interleaved in theory but
@@ -1016,6 +1120,7 @@ class AnthropicStreamAssembler:
             self._output_chars += len(reasoning)
 
         if content:
+            events.extend(self._close_tools())
             events.extend(self._close_thinking())
             if self._text_index is None:
                 self._text_index = self._next_index
@@ -1036,18 +1141,26 @@ class AnthropicStreamAssembler:
                 except (TypeError, ValueError):
                     oi = 0
                 if oi not in self._tools:
+                    # IMPORTANT: do NOT assign content_block index here.
+                    # Name-only / incomplete args must not reserve an index —
+                    # otherwise a later text/thinking block takes a higher index
+                    # and finish() starts the tool at a lower index (out of order
+                    # → secondary relays / Claude Code: "Content block not found").
                     tid = raw.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
-                    bi = self._next_index
-                    self._next_index += 1
                     self._tools[oi] = {
-                        "block_index": bi,
+                        "block_index": None,
                         "id": tid,
                         "name": "",
                         "args": "",
                         "args_sent": 0,
                         "started": False,
+                        "stopped": False,
                     }
                 state = self._tools[oi]
+                # A closed tool index must not be revived mid-stream (would reuse
+                # a stopped content_block index → "Content block not found").
+                if state.get("stopped"):
+                    continue
                 fn = raw.get("function") if isinstance(raw.get("function"), dict) else {}
                 # Keep tool id stable once set (tool_result matching depends on it)
                 if raw.get("id") and not state.get("id"):
@@ -1081,10 +1194,47 @@ class AnthropicStreamAssembler:
                         state.get("args") or "", args_piece
                     )
 
-                # Start tool_use as soon as we know the name (args may arrive later).
-                # Waiting for first args_piece caused intermittent client hangs when
-                # upstream sent name-only first chunk then stalled / finished.
-                if not state["started"] and state.get("name"):
+            # Start / flush in ascending OpenAI tool index order. If a lower tool
+            # is known but not ready, hold higher tools so converters that bind
+            # OpenAI index → first content_block never see index inversion.
+            for oi in sorted(self._tools.keys()):
+                state = self._tools[oi]
+                if state.get("stopped"):
+                    continue
+                args_now = state.get("args") or ""
+                ready = bool(
+                    state.get("name")
+                    and args_now
+                    and is_complete_tool_arguments_json(args_now)
+                )
+                # Open tool_use only when name is known AND args are complete JSON
+                # (or finish() will open). Avoids empty tool blocks that secondary
+                # relays close early, then fail on later input_json_delta.
+                if not state["started"]:
+                    if not ready:
+                        # Known lower tool still buffering — do not start higher ones.
+                        if state.get("name") or state.get("id"):
+                            break
+                        continue
+                    # Also wait for any lower OpenAI index that is missing or not
+                    # yet started. Without this, a high-index complete tool can
+                    # open content_block 0 first; later low-index start looks
+                    # inverted to converters → "Content block not found".
+                    blocked = False
+                    for lower_oi in range(0, oi):
+                        lower = self._tools.get(lower_oi)
+                        if lower is None:
+                            blocked = True
+                            break
+                        if lower.get("stopped"):
+                            continue
+                        if not lower.get("started"):
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+                    state["block_index"] = self._next_index
+                    self._next_index += 1
                     state["started"] = True
                     events.append(
                         anthropic_stream_block_start_tool(
@@ -1093,31 +1243,11 @@ class AnthropicStreamAssembler:
                             name=state["name"],
                         )
                     )
-                # Stream incomplete fragments only. Complete JSON snapshots
-                # (common with secondary relays) are deferred to finish() so
-                # naive-append clients never see doubled / non-prefix rewrites
-                # that break Read.file_path parsing.
+                # Hold incomplete fragments. Emit only complete JSON (or a pure
+                # suffix after a prior complete send). Incomplete live pieces +
+                # later full rewrites corrupt naive-append clients (Read.file_path).
                 if state["started"]:
-                    args = state.get("args") or ""
-                    sent_text = state.get("args_sent_text") or ""
-                    remaining = ""
-                    if args and is_complete_json_text(args):
-                        if sent_text and args.startswith(sent_text) and args != sent_text:
-                            remaining = args[len(sent_text) :]
-                    elif args:
-                        if not sent_text:
-                            remaining = args
-                        elif args.startswith(sent_text):
-                            remaining = args[len(sent_text) :]
-                    if remaining:
-                        events.append(
-                            anthropic_stream_input_json_delta(
-                                state["block_index"], remaining
-                            )
-                        )
-                        state["args_sent_text"] = sent_text + remaining
-                        state["args_sent"] = len(state["args_sent_text"])
-                        self._output_chars += len(remaining)
+                    events.extend(self._flush_tool_args(state))
 
         return events
 
@@ -1133,8 +1263,18 @@ class AnthropicStreamAssembler:
             events.extend(self.start(input_tokens=int(input_tokens or 0)))
         events.extend(self._close_thinking())
         events.extend(self._close_text())
-        for state in self._tools.values():
+        # Open any buffered tools that never became "started" (name without
+        # complete args, or args without live emission), then close all.
+        # Assign block_index only at real start time, in sorted OpenAI index order,
+        # so content_block indices never go backwards mid-stream.
+        for oi in sorted(self._tools.keys()):
+            state = self._tools[oi]
+            if state.get("stopped"):
+                continue
             if not state.get("started"):
+                if state.get("block_index") is None:
+                    state["block_index"] = self._next_index
+                    self._next_index += 1
                 state["started"] = True
                 events.append(
                     anthropic_stream_block_start_tool(
@@ -1143,49 +1283,7 @@ class AnthropicStreamAssembler:
                         name=(state.get("name") or "tool").strip() or "tool",
                     )
                 )
-                args = state.get("args") or ""
-                if args:
-                    events.append(
-                        anthropic_stream_input_json_delta(state["block_index"], args)
-                    )
-                    state["args_sent_text"] = args
-                    state["args_sent"] = len(args)
-                    self._output_chars += len(args)
-                else:
-                    events.append(
-                        anthropic_stream_input_json_delta(state["block_index"], "{}")
-                    )
-                    state["args"] = "{}"
-                    state["args_sent_text"] = "{}"
-                    state["args_sent"] = 2
-                    self._output_chars += 2
-            else:
-                args = state.get("args") or ""
-                sent_text = state.get("args_sent_text") or ""
-                if not args.strip():
-                    events.append(
-                        anthropic_stream_input_json_delta(state["block_index"], "{}")
-                    )
-                    state["args"] = "{}"
-                    state["args_sent_text"] = "{}"
-                    state["args_sent"] = 2
-                    self._output_chars += 2
-                elif sent_text and not args.startswith(sent_text):
-                    # Client already has a non-prefix snapshot; do not corrupt it.
-                    pass
-                else:
-                    remaining = args[len(sent_text) :]
-                    if remaining:
-                        events.append(
-                            anthropic_stream_input_json_delta(
-                                state["block_index"], remaining
-                            )
-                        )
-                        state["args_sent_text"] = args
-                        state["args_sent"] = len(args)
-                        self._output_chars += len(remaining)
-            if state.get("started"):
-                events.append(anthropic_stream_block_stop(state["block_index"]))
+        events.extend(self._close_tools())
         # Upstream often finishes with stop even when tools were emitted.
         effective_finish = finish_reason
         if self._saw_tool and effective_finish in (None, "stop", "end_turn", ""):
