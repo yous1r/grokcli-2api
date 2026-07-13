@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-13-inline-captcha-1"
+ADAPTER_BUILD = "2026-07-13-reg-stop-fast-1"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -67,8 +67,18 @@ DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "3") or 3)
 _sessions: dict[str, dict[str, Any]] = {}
 _batches: dict[str, dict[str, Any]] = {}
 _lock = threading.RLock()
+# batch_id -> True while a local ThreadPool spawner is alive in THIS process.
+_active_batch_runners: dict[str, bool] = {}
+# Local captcha solver is process-local and can collapse under fan-out; serialize
+# the createTask/getTaskResult handshake across registration workers.
+_local_captcha_lock = threading.RLock()
 _xconsole_ready = False
 _xconsole_error: str | None = None
+
+REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
+# How many jobs may be pre-created (mailbox + session) beyond the live concurrency
+# cap. Keep small so stop/cancel doesn't waste dozens of mailboxes.
+REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "1") or 1)
 
 
 def _now() -> float:
@@ -82,6 +92,100 @@ def _reg_redis() -> bool:
         return redis_enabled()
     except Exception:
         return False
+
+
+def _batch_runner_lock_key(batch_id: str) -> str:
+    try:
+        from store.redis_client import key
+
+        return key("reg", "runner", batch_id)
+    except Exception:
+        return f"g2a:reg:runner:{batch_id}"
+
+
+def _try_acquire_batch_runner(batch_id: str) -> tuple[bool, str | None]:
+    """Claim exclusive spawner ownership for a batch (cross-worker).
+
+    Returns (acquired, token). Local-process claim always required; Redis NX
+    is used when available so multi-worker won't double-spawn.
+    """
+    bid = str(batch_id or "").strip()
+    if not bid:
+        return False, None
+    with _lock:
+        if _active_batch_runners.get(bid):
+            return False, None
+        _active_batch_runners[bid] = True
+    token = f"{uuid.uuid4().hex}|{os.getpid()}|{_now():.0f}"
+    if _reg_redis():
+        try:
+            from store.redis_client import set_nx_ex, worker_id
+
+            token = f"{worker_id()}|{os.getpid()}|{uuid.uuid4().hex[:10]}"
+            ok = set_nx_ex(_batch_runner_lock_key(bid), token, REG_BATCH_RUNNER_LOCK_TTL)
+            if not ok:
+                with _lock:
+                    _active_batch_runners.pop(bid, None)
+                return False, None
+        except Exception:
+            # Fall through to local-only claim.
+            pass
+    return True, token
+
+
+def _renew_batch_runner(batch_id: str, token: str | None) -> None:
+    if not token or not _reg_redis():
+        return
+    try:
+        from store.redis_client import renew_if_owner
+
+        renew_if_owner(_batch_runner_lock_key(batch_id), token, REG_BATCH_RUNNER_LOCK_TTL)
+    except Exception:
+        pass
+
+
+def _release_batch_runner(batch_id: str, token: str | None) -> None:
+    bid = str(batch_id or "").strip()
+    with _lock:
+        _active_batch_runners.pop(bid, None)
+    if token and _reg_redis():
+        try:
+            from store.redis_client import compare_and_delete
+
+            compare_and_delete(_batch_runner_lock_key(bid), token)
+        except Exception:
+            pass
+
+
+def _snapshot_reg_config(
+    *,
+    captcha_provider: str,
+    yescaptcha_key: str,
+    proxy: str,
+    moemail_api_key: str | None,
+    moemail_base_url: str | None,
+    prefix: str | None,
+    domain: str | None,
+    expiry_ms: int | None,
+    concurrency: int,
+    stagger_ms: int,
+    mail_provider: str | None = None,
+) -> dict[str, Any]:
+    """Config snapshot kept with the in-memory/Redis batch while it is running."""
+    return {
+        "captcha_provider": captcha_provider,
+        "yescaptcha_key": yescaptcha_key if captcha_provider == "yescaptcha" else "",
+        "proxy": proxy or "",
+        "moemail_api_key": moemail_api_key or "",
+        "moemail_base_url": moemail_base_url or "",
+        "prefix": prefix or "",
+        "domain": domain or "",
+        "expiry_ms": expiry_ms,
+        "concurrency": concurrency,
+        "stagger_ms": stagger_ms,
+        "local_solver_url": "http://127.0.0.1:5072",
+        "mail_provider": (mail_provider or "moemail").strip().lower() or "moemail",
+    }
 
 
 class _RegCancelled(Exception):
@@ -358,7 +462,7 @@ def registration_available() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# mail provider: moemail (reuse grokcli-2api config)
+# mail provider: moemail / yyds (reuse grokcli-2api config)
 # --------------------------------------------------------------------------- #
 def _make_email_receiver(
     *,
@@ -367,49 +471,82 @@ def _make_email_receiver(
     prefix: str | None = None,
     domain: str | None = None,
     expiry_ms: int | None = None,
+    mail_provider: str | None = None,
 ):
-    from moemail import moemail_create_mailbox
+    from moemail import create_mailbox, fetch_messages, normalize_mail_provider
     from config import MOEMAIL_API_KEY, MOEMAIL_BASE_URL, MOEMAIL_DOMAIN, MOEMAIL_EXPIRY_MS
 
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     if not key:
         raise ValueError(
-            "MoeMail API key missing. Set GROK2API_MOEMAIL_API_KEY or pass api_key."
+            "Mail API key missing. Set GROK2API_MOEMAIL_API_KEY or pass api_key."
         )
     base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
-    dom = (domain or MOEMAIL_DOMAIN).strip(".")
+    prov = normalize_mail_provider(mail_provider, base_url=base)
+    dom = (domain or MOEMAIL_DOMAIN or "").strip(".")
     pre = (prefix or f"grok-{secrets.token_hex(4)}").lower()
 
-    mailbox = moemail_create_mailbox(
+    mailbox = create_mailbox(
+        provider=prov,
         name=pre,
-        domain=dom,
+        domain=dom or None,
         expiry_ms=expiry_ms if expiry_ms is not None else MOEMAIL_EXPIRY_MS,
         api_key=key,
         base_url=base,
     )
     email_id = mailbox["id"]
     address = mailbox["email"]
+    token = str(mailbox.get("token") or "")
 
-    class _MoeMailReceiver:
-        def __init__(self, email: str, email_id: str, api_key: str | None, base_url: str | None):
+    class _MailReceiver:
+        def __init__(
+            self,
+            email: str,
+            email_id: str,
+            api_key: str | None,
+            base_url: str | None,
+            *,
+            provider: str,
+            token: str = "",
+        ):
             self.email = email
             self.email_id = email_id
             self.api_key = api_key
-            self.base_url = base_url or "https://moemail.521884.xyz"
+            if provider == "yyds":
+                default_base = "https://maliapi.215.im"
+            elif provider == "gptmail":
+                default_base = "https://mail.chatgpt.org.uk"
+            else:
+                default_base = "https://moemail.521884.xyz"
+            self.base_url = base_url or default_base
+            self.provider = provider
+            self.token = token
 
-        def wait_for_code(self, timeout: float = 120) -> str:
-            from moemail import moemail_fetch_messages
+        def wait_for_code(
+            self,
+            timeout: float = 120,
+            *,
+            should_cancel=None,
+            poll_interval: float | None = None,
+        ) -> str:
             import re as _re
 
-            deadline = time.time() + timeout
-            poll = 1.5
+            deadline = time.time() + float(timeout or 120)
+            # Keep polls short so cooperative cancel can land quickly.
+            poll = float(poll_interval if poll_interval is not None else 1.0)
+            poll = max(0.4, min(poll, 2.0))
             while time.time() < deadline:
+                if callable(should_cancel) and should_cancel():
+                    raise _RegCancelled("cancelled while waiting for email code")
                 try:
-                    messages = moemail_fetch_messages(
+                    messages = fetch_messages(
                         self.email_id,
+                        provider=self.provider,
                         api_key=self.api_key,
                         base_url=self.base_url,
                         include_details=True,
+                        address=self.email,
+                        token=self.token or None,
                     )
                     for item in messages:
                         # Prefer xAI AAA-BBB codes first.
@@ -418,9 +555,14 @@ def _make_email_receiver(
                             for k in (
                                 "subject",
                                 "content",
+                                "text",
+                                "textBody",
                                 "html",
+                                "htmlBody",
+                                "body",
                                 "from_address",
                                 "from",
+                                "verificationCode",
                             )
                         )
                         match = _re.search(
@@ -442,11 +584,25 @@ def _make_email_receiver(
                                 return clean
                 except Exception:
                     pass
-                time.sleep(poll)
-                poll = min(3.0, poll + 0.25)
+                # Sleep in small slices so stop can interrupt mid-wait.
+                slept = 0.0
+                while slept < poll:
+                    if callable(should_cancel) and should_cancel():
+                        raise _RegCancelled("cancelled while waiting for email code")
+                    step = min(0.25, poll - slept)
+                    time.sleep(step)
+                    slept += step
+                poll = min(2.0, poll + 0.15)
             raise RuntimeError("timeout waiting for xAI email verification code")
 
-    return address, _MoeMailReceiver(address, email_id, api_key=key, base_url=base)
+    return address, _MailReceiver(
+        address,
+        email_id,
+        api_key=key,
+        base_url=base,
+        provider=prov,
+        token=token,
+    )
 
 
 def _proxy_url() -> str:
@@ -469,6 +625,7 @@ def _prepare_registration_session(
     prefix: str | None = None,
     domain: str | None = None,
     expiry_ms: int | None = None,
+    mail_provider: str | None = None,
     batch_id: str | None = None,
     batch_index: int | None = None,
     batch_total: int | None = None,
@@ -485,6 +642,7 @@ def _prepare_registration_session(
             prefix=prefix,
             domain=domain,
             expiry_ms=expiry_ms,
+            mail_provider=mail_provider,
         )
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
@@ -533,6 +691,7 @@ def _start_one_registration(
     prefix: str | None = None,
     domain: str | None = None,
     expiry_ms: int | None = None,
+    mail_provider: str | None = None,
     batch_id: str | None = None,
     batch_index: int | None = None,
     batch_total: int | None = None,
@@ -547,6 +706,7 @@ def _start_one_registration(
         prefix=prefix,
         domain=domain,
         expiry_ms=expiry_ms,
+        mail_provider=mail_provider,
         batch_id=batch_id,
         batch_index=batch_index,
         batch_total=batch_total,
@@ -590,6 +750,7 @@ def start_registration(
     prefix: str | None = None,
     domain: str | None = None,
     expiry_ms: int | None = None,
+    mail_provider: str | None = None,
     count: int | None = None,
     concurrency: int | None = None,
     stagger_ms: int | None = None,
@@ -692,6 +853,12 @@ def start_registration(
     stagger = max(0, min(stagger, 10_000))
 
     proxy_val = (proxy or _proxy_url() or "").strip()
+    try:
+        from moemail import normalize_mail_provider as _norm_mail
+
+        mail_prov = _norm_mail(mail_provider, base_url=moemail_base_url)
+    except Exception:
+        mail_prov = (mail_provider or "moemail").strip().lower() or "moemail"
 
     # Single job — keep original response shape for UI compatibility.
     if n == 1:
@@ -703,9 +870,23 @@ def start_registration(
             prefix=prefix,
             domain=domain,
             expiry_ms=expiry_ms,
+            mail_provider=mail_prov,
         )
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
+    reg_cfg = _snapshot_reg_config(
+        captcha_provider=provider,
+        yescaptcha_key=key,
+        proxy=proxy_val,
+        moemail_api_key=moemail_api_key,
+        moemail_base_url=moemail_base_url,
+        prefix=prefix,
+        domain=domain,
+        expiry_ms=expiry_ms,
+        concurrency=workers,
+        stagger_ms=stagger,
+        mail_provider=mail_prov,
+    )
     batch = {
         "id": batch_id,
         "status": "running",
@@ -718,166 +899,36 @@ def start_registration(
         "adapter_build": ADAPTER_BUILD,
         "message": f"batch started count={n} concurrency={workers}",
         "error": None,
+        "finished": 0,
+        "ok_count": 0,
+        "fail_count": 0,
+        "spawned": 0,
+        "reg_config": reg_cfg,
+        "owner_pid": os.getpid(),
+        "runner_alive": True,
+        "cancel_requested": False,
     }
     with _lock:
         _batches[batch_id] = batch
     _mirror_reg_batch(batch_id, batch)
 
-    def _run_batch() -> None:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        errors: list[str] = []
-        finished = 0
-        ok_n = 0
-        fail_n = 0
-
-        def _job(i: int) -> dict[str, Any]:
-            # Honour batch-level stop before creating more mailboxes.
-            with _lock:
-                b0 = _batches.get(batch_id) or {}
-                if b0.get("cancel_requested") or str(b0.get("status") or "").lower() in (
-                    "stopping",
-                    "cancelled",
-                    "stopped",
-                ):
-                    return {
-                        "ok": False,
-                        "id": None,
-                        "status": "cancelled",
-                        "error": "cancelled before start",
-                    }
-            # Small per-slot stagger only (not cumulative across the whole batch).
-            delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
-            prepared = _prepare_registration_session(
-                yescaptcha_key=key,
-                proxy=proxy_val,
-                moemail_api_key=moemail_api_key,
-                moemail_base_url=moemail_base_url,
-                prefix=prefix,
-                domain=domain,
-                expiry_ms=expiry_ms,
-                batch_id=batch_id,
-                batch_index=i,
-                batch_total=n,
-                start_delay=delay,
-            )
-            if not prepared.get("ok"):
-                return prepared
-            sid = str(prepared.get("id") or "")
-            with _lock:
-                # Re-check cancel after prepare (user may stop mid-queue).
-                b1 = _batches.get(batch_id) or {}
-                sess = _sessions.get(sid) or {}
-                if b1.get("cancel_requested") or sess.get("cancel_requested"):
-                    if sid in _sessions:
-                        _sessions[sid]["status"] = "cancelled"
-                        _sessions[sid]["message"] = "cancelled before worker start"
-                        _sessions[sid]["error"] = "cancelled"
-                        _sessions[sid]["cancel_requested"] = True
-                        _sessions[sid]["updated_at"] = _now()
-                        _sessions[sid].pop("_receiver", None)
-                        _mirror_reg_sess(sid, _sessions[sid])
-                    return {
-                        "ok": False,
-                        "id": sid,
-                        "status": "cancelled",
-                        "error": "cancelled",
-                        "email": sess.get("email"),
-                    }
-                receiver = sess.get("_receiver")
-                if sid in _sessions:
-                    _sessions[sid]["status"] = "started"
-                    _sessions[sid]["message"] = (
-                        f"started; email={_sessions[sid].get('email') or ''}"
-                    )
-                    _sessions[sid]["updated_at"] = _now()
-                    _mirror_reg_sess(sid, _sessions[sid])
-            if not sid or receiver is None:
-                return {"ok": False, "error": "registration session prepare failed", "id": sid}
-            # Run the full registration inside the pool worker so concurrency
-            # truly limits in-flight work (e.g. 3 threads => 3 at a time).
-            try:
-                _run_registration(sid, key, proxy_val or "", receiver)
-            finally:
-                with _lock:
-                    if sid in _sessions:
-                        _sessions[sid].pop("_receiver", None)
-            with _lock:
-                final = _sessions.get(sid) or {}
-            st = str(final.get("status") or "")
-            ok = st in ("imported", "success", "completed")
-            return {
-                "ok": ok,
-                "id": sid,
-                "status": st,
-                "error": final.get("error"),
-                "email": final.get("email"),
-            }
-
-        try:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix=f"gba-batch-{batch_id[-6:]}"
-            ) as pool:
-                futs = {pool.submit(_job, i): i for i in range(1, n + 1)}
-                for fut in as_completed(futs):
-                    idx = futs[fut]
-                    finished += 1
-                    try:
-                        r = fut.result()
-                        if r.get("ok"):
-                            ok_n += 1
-                        else:
-                            fail_n += 1
-                            errors.append(
-                                f"#{idx}: {r.get('error') or r.get('status') or 'failed'}"
-                            )
-                    except Exception as e:  # noqa: BLE001
-                        fail_n += 1
-                        errors.append(f"#{idx}: {e}")
-                    with _lock:
-                        b = _batches.get(batch_id)
-                        if b is not None:
-                            b["updated_at"] = _now()
-                            b["status"] = "running"
-                            b["finished"] = finished
-                            b["ok_count"] = ok_n
-                            b["fail_count"] = fail_n
-                            b["spawned"] = len(b.get("session_ids") or [])
-                            b["spawn_errors"] = errors[-20:]
-                            b["message"] = (
-                                f"running {finished}/{n} done "
-                                f"(ok={ok_n} fail={fail_n}, threads={workers})"
-                            )
-                            _mirror_reg_batch(batch_id, dict(b))
-        finally:
-            with _lock:
-                b = _batches.get(batch_id)
-                if b is not None:
-                    b["updated_at"] = _now()
-                    b["finished"] = finished
-                    b["ok_count"] = ok_n
-                    b["fail_count"] = fail_n
-                    b["spawned"] = len(b.get("session_ids") or [])
-                    b["spawn_errors"] = errors[-20:]
-                    if fail_n and not ok_n:
-                        b["status"] = "error"
-                        b["error"] = "; ".join(errors[:5]) or "all failed"
-                    elif fail_n:
-                        b["status"] = "partial"
-                    else:
-                        b["status"] = "done"
-                    b["message"] = (
-                        f"finished {finished}/{n} "
-                        f"(ok={ok_n} fail={fail_n}, threads={workers})"
-                        + (f"; errors={len(errors)}" if errors else "")
-                    )
-                    _mirror_reg_batch(batch_id, dict(b))
-
-    threading.Thread(
-        target=_run_batch,
-        daemon=True,
-        name=f"gba-batch-{batch_id[-8:]}",
-    ).start()
+    started = _spawn_batch_runner(
+        batch_id,
+        remaining=n,
+        concurrency=workers,
+        stagger_ms=stagger,
+        captcha_provider=provider,
+        yescaptcha_key=key,
+        proxy=proxy_val,
+        moemail_api_key=moemail_api_key,
+        moemail_base_url=moemail_base_url,
+        prefix=prefix,
+        domain=domain,
+        expiry_ms=expiry_ms,
+        mail_provider=mail_prov,
+    )
+    if not started.get("ok"):
+        return started
 
     # Brief wait so the first wave (up to `workers`) is usually visible to UI.
     time.sleep(min(0.45, 0.08 * workers + 0.08))
@@ -905,6 +956,471 @@ def start_registration(
     }
 
 
+def _spawn_batch_runner(
+    batch_id: str,
+    *,
+    remaining: int,
+    concurrency: int,
+    stagger_ms: int,
+    captcha_provider: str,
+    yescaptcha_key: str,
+    proxy: str,
+    moemail_api_key: str | None,
+    moemail_base_url: str | None,
+    prefix: str | None,
+    domain: str | None,
+    expiry_ms: int | None,
+    mail_provider: str | None = None,
+) -> dict[str, Any]:
+    """Start the ThreadPool spawner for a batch. No resume/restart path."""
+    bid = str(batch_id or "").strip()
+    if not bid:
+        return {"ok": False, "error": "missing batch id"}
+    batch = _load_reg_batch(bid)
+    if not batch:
+        return {"ok": False, "error": "registration batch not found"}
+
+    if remaining <= 0:
+        with _lock:
+            b = _batches.get(bid) or dict(batch)
+            b["runner_alive"] = False
+            b["status"] = "done"
+            b["updated_at"] = _now()
+            b["message"] = "nothing to spawn"
+            _batches[bid] = b
+            _mirror_reg_batch(bid, dict(b))
+        return {
+            "ok": True,
+            "batch_id": bid,
+            "already_complete": True,
+            "remaining": 0,
+            "batch": get_registration_batch(bid),
+        }
+
+    acquired, lock_token = _try_acquire_batch_runner(bid)
+    if not acquired:
+        return {
+            "ok": False,
+            "error": "batch runner already active on another worker",
+            "batch_id": bid,
+            "already_running": True,
+        }
+
+    provider = (captcha_provider or "local").strip().lower()
+    if provider not in {"local", "yescaptcha"}:
+        provider = "local"
+    key = (yescaptcha_key or "").strip()
+    if provider == "local":
+        key = "local"
+        solver_url = "http://127.0.0.1:5072"
+        try:
+            globals()["CAPTCHA_PROVIDER"] = "local"
+            globals()["LOCAL_SOLVER_URL"] = solver_url
+        except Exception:
+            pass
+        os.environ["GROK2API_CAPTCHA_PROVIDER"] = "local"
+        os.environ["CAPTCHA_PROVIDER"] = "local"
+        os.environ["GROK2API_LOCAL_SOLVER_URL"] = solver_url
+        os.environ["LOCAL_SOLVER_URL"] = solver_url
+        os.environ["GROK2API_YESCAPTCHA_ENDPOINT"] = solver_url
+        os.environ["YESCAPTCHA_ENDPOINT"] = solver_url
+    else:
+        if not key:
+            _release_batch_runner(bid, lock_token)
+            return {
+                "ok": False,
+                "error": "YESCAPTCHA_KEY missing",
+                "batch_id": bid,
+            }
+        try:
+            globals()["CAPTCHA_PROVIDER"] = "yescaptcha"
+            globals()["YESCAPTCHA_KEY"] = key
+            globals()["LOCAL_SOLVER_URL"] = ""
+        except Exception:
+            pass
+        for k in (
+            "GROK2API_LOCAL_SOLVER_URL",
+            "LOCAL_SOLVER_URL",
+            "GROK2API_YESCAPTCHA_ENDPOINT",
+            "YESCAPTCHA_ENDPOINT",
+            "YESCAPTCHA_API_BASE",
+        ):
+            os.environ.pop(k, None)
+
+    proxy_val = (proxy or "").strip()
+    workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), MAX_CONCURRENCY, remaining))
+    stagger = max(0, min(int(stagger_ms or 400), 10_000))
+
+    with _lock:
+        b = _batches.get(bid) or dict(batch)
+        b["status"] = "running"
+        b["cancel_requested"] = False
+        b["concurrency"] = workers
+        b["stagger_ms"] = stagger
+        b["runner_alive"] = True
+        b["owner_pid"] = os.getpid()
+        b["adapter_build"] = ADAPTER_BUILD
+        b["reg_config"] = _snapshot_reg_config(
+            captcha_provider=provider,
+            yescaptcha_key=key,
+            proxy=proxy_val,
+            moemail_api_key=moemail_api_key,
+            moemail_base_url=moemail_base_url,
+            prefix=prefix,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            concurrency=workers,
+            stagger_ms=stagger,
+            mail_provider=mail_provider,
+        )
+        b["updated_at"] = _now()
+        b["message"] = f"starting remaining={remaining} threads={workers}"
+        b["finished"] = 0
+        b["ok_count"] = 0
+        b["fail_count"] = 0
+        _batches[bid] = b
+        _mirror_reg_batch(bid, dict(b))
+
+    def _run_batch() -> None:
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        errors: list[str] = []
+        finished = 0
+        ok_n = 0
+        fail_n = 0
+        stop_renew = False
+        # Feed the pool gradually: only keep ~workers(+prefetch) jobs prepared
+        # at once. Submitting all remaining jobs up-front used to create hundreds
+        # of mailboxes immediately and made stop/cancel racey under multi-thread.
+        next_i = 1
+        in_flight: dict[Any, int] = {}
+        prefetch = max(0, min(int(REG_PREFETCH_SLOTS), max(0, workers)))
+        max_inflight = max(1, workers + prefetch)
+
+        def _batch_cancel_requested() -> bool:
+            with _lock:
+                local = _batches.get(bid) or {}
+            if local.get("cancel_requested") or str(local.get("status") or "").lower() in (
+                "stopping",
+                "cancelled",
+                "stopped",
+            ):
+                return True
+            if not _reg_redis():
+                return False
+            try:
+                from store import sessions_redis
+
+                remote = sessions_redis.reg_batch_get(bid)
+                if not isinstance(remote, dict):
+                    return False
+                if remote.get("cancel_requested") or str(remote.get("status") or "").lower() in (
+                    "stopping",
+                    "cancelled",
+                    "stopped",
+                ):
+                    with _lock:
+                        cur = _batches.get(bid) or dict(remote)
+                        cur["cancel_requested"] = True
+                        if str(cur.get("status") or "").lower() not in (
+                            "cancelled",
+                            "stopped",
+                            "done",
+                            "partial",
+                            "error",
+                        ):
+                            cur["status"] = remote.get("status") or "stopping"
+                            if remote.get("message"):
+                                cur["message"] = remote.get("message")
+                        cur["updated_at"] = _now()
+                        _batches[bid] = cur
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _renew_loop() -> None:
+            while not stop_renew:
+                time.sleep(max(5.0, REG_BATCH_RUNNER_LOCK_TTL / 3))
+                if stop_renew:
+                    break
+                if _batch_cancel_requested():
+                    # Keep heartbeat while draining, but mark status as stopping.
+                    with _lock:
+                        bb = _batches.get(bid)
+                        if bb is not None:
+                            bb["cancel_requested"] = True
+                            if str(bb.get("status") or "").lower() not in (
+                                "cancelled",
+                                "stopped",
+                                "done",
+                                "partial",
+                                "error",
+                            ):
+                                bb["status"] = "stopping"
+                            bb["updated_at"] = _now()
+                            bb["runner_alive"] = True
+                            _mirror_reg_batch(bid, dict(bb))
+                _renew_batch_runner(bid, lock_token)
+                with _lock:
+                    bb = _batches.get(bid)
+                    if bb is not None:
+                        bb["updated_at"] = _now()
+                        bb["runner_alive"] = True
+                        bb["owner_pid"] = os.getpid()
+                        _mirror_reg_batch(bid, dict(bb))
+
+        renew_t = threading.Thread(
+            target=_renew_loop,
+            daemon=True,
+            name=f"gba-batch-lock-{bid[-8:]}",
+        )
+        renew_t.start()
+
+        def _job(i: int) -> dict[str, Any]:
+            # Honour batch-level stop before creating more mailboxes.
+            if _batch_cancel_requested():
+                return {
+                    "ok": False,
+                    "id": None,
+                    "status": "cancelled",
+                    "error": "cancelled before start",
+                }
+            # Small per-slot stagger only (not cumulative across the whole batch).
+            delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
+            prepared = _prepare_registration_session(
+                yescaptcha_key=key,
+                proxy=proxy_val,
+                moemail_api_key=moemail_api_key,
+                moemail_base_url=moemail_base_url,
+                prefix=prefix,
+                domain=domain,
+                expiry_ms=expiry_ms,
+                mail_provider=mail_provider,
+                batch_id=bid,
+                batch_index=i,
+                batch_total=int((_load_reg_batch(bid) or {}).get("count") or remaining),
+                start_delay=delay,
+            )
+            if not prepared.get("ok"):
+                return prepared
+            sid = str(prepared.get("id") or "")
+            with _lock:
+                # Re-check cancel after prepare (user may stop mid-queue).
+                b1 = _batches.get(bid) or {}
+                sess = _sessions.get(sid) or {}
+                if (
+                    b1.get("cancel_requested")
+                    or str(b1.get("status") or "").lower() in ("stopping", "cancelled", "stopped")
+                    or sess.get("cancel_requested")
+                ):
+                    if sid in _sessions:
+                        _sessions[sid]["status"] = "cancelled"
+                        _sessions[sid]["message"] = "cancelled before worker start"
+                        _sessions[sid]["error"] = "cancelled"
+                        _sessions[sid]["cancel_requested"] = True
+                        _sessions[sid]["updated_at"] = _now()
+                        _sessions[sid].pop("_receiver", None)
+                        _mirror_reg_sess(sid, _sessions[sid])
+                    return {
+                        "ok": False,
+                        "id": sid,
+                        "status": "cancelled",
+                        "error": "cancelled",
+                        "email": sess.get("email"),
+                    }
+                receiver = sess.get("_receiver")
+                if sid in _sessions:
+                    _sessions[sid]["status"] = "started"
+                    _sessions[sid]["message"] = (
+                        f"started; email={_sessions[sid].get('email') or ''}"
+                    )
+                    _sessions[sid]["updated_at"] = _now()
+                    _mirror_reg_sess(sid, _sessions[sid])
+            if not sid or receiver is None:
+                return {"ok": False, "error": "registration session prepare failed", "id": sid}
+            try:
+                _run_registration(sid, key, proxy_val or "", receiver)
+            finally:
+                with _lock:
+                    if sid in _sessions:
+                        _sessions[sid].pop("_receiver", None)
+            with _lock:
+                final = _sessions.get(sid) or {}
+            st = str(final.get("status") or "")
+            ok = st in ("imported", "success", "completed")
+            return {
+                "ok": ok,
+                "id": sid,
+                "status": st,
+                "error": final.get("error"),
+                "email": final.get("email"),
+            }
+
+        def _note_result(idx: int, r: dict[str, Any] | None = None, exc: Exception | None = None) -> None:
+            nonlocal finished, ok_n, fail_n
+            finished += 1
+            if exc is not None:
+                fail_n += 1
+                errors.append(f"#{idx}: {exc}")
+            elif not isinstance(r, dict):
+                fail_n += 1
+                errors.append(f"#{idx}: empty result")
+            elif r.get("ok"):
+                ok_n += 1
+            else:
+                fail_n += 1
+                errors.append(
+                    f"#{idx}: {r.get('error') or r.get('status') or 'failed'}"
+                )
+            with _lock:
+                b = _batches.get(bid)
+                if b is not None:
+                    b["updated_at"] = _now()
+                    # Don't clobber explicit stop marker.
+                    if not b.get("cancel_requested"):
+                        b["status"] = "running"
+                    b["finished"] = finished
+                    b["ok_count"] = ok_n
+                    b["fail_count"] = fail_n
+                    b["spawned"] = len(b.get("session_ids") or [])
+                    b["spawn_errors"] = errors[-20:]
+                    b["runner_alive"] = True
+                    b["inflight"] = len(in_flight)
+                    b["message"] = (
+                        f"running {finished}/{target_total} done "
+                        f"(ok={ok_n} fail={fail_n}, threads={workers}, "
+                        f"inflight={len(in_flight)})"
+                    )
+                    _mirror_reg_batch(bid, dict(b))
+
+        try:
+            target_total = int((_load_reg_batch(bid) or {}).get("count") or remaining)
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=f"gba-batch-{bid[-6:]}"
+            ) as pool:
+                while True:
+                    # Fill up to concurrency(+prefetch) only while not cancelled.
+                    while (
+                        next_i <= remaining
+                        and len(in_flight) < max_inflight
+                        and not _batch_cancel_requested()
+                    ):
+                        fut = pool.submit(_job, next_i)
+                        in_flight[fut] = next_i
+                        next_i += 1
+                        with _lock:
+                            bb = _batches.get(bid)
+                            if bb is not None:
+                                bb["inflight"] = len(in_flight)
+                                bb["updated_at"] = _now()
+                                if not bb.get("cancel_requested"):
+                                    bb["status"] = "running"
+                                bb["message"] = (
+                                    f"running {finished}/{target_total} done "
+                                    f"(ok={ok_n} fail={fail_n}, threads={workers}, "
+                                    f"inflight={len(in_flight)})"
+                                )
+                                _mirror_reg_batch(bid, dict(bb))
+
+                    if not in_flight:
+                        break
+
+                    done, _pending = wait(
+                        set(in_flight.keys()),
+                        return_when=FIRST_COMPLETED,
+                        timeout=0.5,
+                    )
+                    if not done:
+                        # Timeout tick: re-check cancel and refresh progress.
+                        if _batch_cancel_requested():
+                            # Stop feeding new jobs; still drain in-flight workers.
+                            pass
+                        continue
+                    for fut in done:
+                        idx = in_flight.pop(fut, 0)
+                        try:
+                            r = fut.result()
+                            _note_result(idx, r=r)
+                        except Exception as e:  # noqa: BLE001
+                            _note_result(idx, exc=e)
+
+                    # If cancelled and no more work in flight, exit promptly.
+                    if _batch_cancel_requested() and not in_flight:
+                        break
+                    # If cancelled, do not submit more jobs even if capacity frees.
+                    if _batch_cancel_requested():
+                        continue
+        finally:
+            stop_renew = True
+            # Best-effort cancel of any leftover futures (usually empty now).
+            for fut in list(in_flight.keys()):
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            with _lock:
+                b = _batches.get(bid)
+                if b is not None:
+                    b["updated_at"] = _now()
+                    b["finished"] = finished
+                    b["ok_count"] = ok_n
+                    b["fail_count"] = fail_n
+                    b["spawned"] = len(b.get("session_ids") or [])
+                    b["spawn_errors"] = errors[-20:]
+                    b["runner_alive"] = False
+                    b["inflight"] = 0
+                    target_total = int(b.get("count") or finished or 0)
+                    cancelled = bool(b.get("cancel_requested")) or str(b.get("status") or "").lower() in (
+                        "stopping",
+                        "cancelled",
+                        "stopped",
+                    )
+                    if cancelled and finished < target_total:
+                        b["status"] = "cancelled"
+                        b["message"] = (
+                            f"stopped {finished}/{target_total} "
+                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                        )
+                    elif fail_n and not ok_n:
+                        b["status"] = "error"
+                        b["error"] = "; ".join(errors[:5]) or "all failed"
+                        b["message"] = (
+                            f"finished {finished}/{target_total} "
+                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            + (f"; errors={len(errors)}" if errors else "")
+                        )
+                    elif fail_n:
+                        b["status"] = "partial"
+                        b["message"] = (
+                            f"finished {finished}/{target_total} "
+                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            + (f"; errors={len(errors)}" if errors else "")
+                        )
+                    else:
+                        b["status"] = "done"
+                        b["message"] = (
+                            f"finished {finished}/{target_total} "
+                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                        )
+                    _mirror_reg_batch(bid, dict(b))
+            _release_batch_runner(bid, lock_token)
+
+    threading.Thread(
+        target=_run_batch,
+        daemon=True,
+        name=f"gba-batch-{bid[-8:]}",
+    ).start()
+
+    return {
+        "ok": True,
+        "batch_id": bid,
+        "remaining": remaining,
+        "concurrency": workers,
+        "message": f"started batch {bid}: remaining={remaining} threads={workers}",
+    }
+
+
 def _run_registration(
     sid: str,
     yescaptcha_key: str,
@@ -923,26 +1439,60 @@ def _run_registration(
         _sessions[sid] = sess
 
     def _refresh_cancel_from_redis() -> None:
-        """Pull cancel_requested from Redis so multi-worker stop works."""
+        """Pull cancel_requested from Redis so multi-worker stop works.
+
+        Also honour batch-level stop so stopping a batch reaches in-flight
+        sessions even if the session mirror lags.
+        """
         if not _reg_redis():
             return
         try:
             from store import sessions_redis
 
             remote = sessions_redis.reg_sess_get(sid)
-            if not isinstance(remote, dict):
-                return
-            if not (
+            batch_cancel = False
+            remote_batch = None
+            bid = ""
+            with _lock:
+                local_sess = _sessions.get(sid) or sess or {}
+                bid = str(local_sess.get("batch_id") or "")
+            if not bid and isinstance(remote, dict):
+                bid = str(remote.get("batch_id") or "")
+            if bid:
+                try:
+                    remote_batch = sessions_redis.reg_batch_get(bid)
+                except Exception:
+                    remote_batch = None
+                if isinstance(remote_batch, dict) and (
+                    remote_batch.get("cancel_requested")
+                    or _is_cancel_status(remote_batch.get("status"))
+                ):
+                    batch_cancel = True
+                    with _lock:
+                        bb = _batches.get(bid) or dict(remote_batch)
+                        bb["cancel_requested"] = True
+                        if str(bb.get("status") or "").lower() not in (
+                            "cancelled",
+                            "stopped",
+                            "done",
+                            "partial",
+                            "error",
+                        ):
+                            bb["status"] = remote_batch.get("status") or "stopping"
+                        bb["updated_at"] = _now()
+                        _batches[bid] = bb
+
+            sess_cancel = isinstance(remote, dict) and (
                 remote.get("cancel_requested")
                 or _is_cancel_status(remote.get("status"))
-            ):
+            )
+            if not sess_cancel and not batch_cancel:
                 return
             with _lock:
                 cur = _sessions.get(sid) or sess
                 cur["cancel_requested"] = True
-                # Keep local progress status unless already terminal/stopping.
                 if str(cur.get("status") or "").lower() not in _TERMINAL_STATUSES:
-                    if str(remote.get("status") or "").lower() in (
+                    if sess_cancel and str(remote.get("status") or "").lower() in (
                         "stopping",
                         "cancelled",
                         "stopped",
@@ -950,6 +1500,9 @@ def _run_registration(
                         cur["status"] = remote.get("status") or "stopping"
                         if remote.get("message"):
                             cur["message"] = remote.get("message")
+                    elif batch_cancel:
+                        cur["status"] = "stopping"
+                        cur["message"] = "stop requested via batch"
                 _sessions[sid] = cur
         except Exception:
             pass
@@ -958,8 +1511,16 @@ def _run_registration(
         _refresh_cancel_from_redis()
         with _lock:
             cur = _sessions.get(sid) or sess
+            # Batch-level cancel also aborts this worker.
+            bid = str(cur.get("batch_id") or "")
+            batch_hit = False
+            if bid:
+                bb = _batches.get(bid) or {}
+                if bb.get("cancel_requested") or _is_cancel_status(bb.get("status")):
+                    batch_hit = True
+                    cur["cancel_requested"] = True
             # Do not overwrite a terminal cancel with intermediate progress.
-            if _session_cancel_requested(cur) and status not in (
+            if (_session_cancel_requested(cur) or batch_hit) and status not in (
                 "cancelled",
                 "stopped",
                 "error",
@@ -977,6 +1538,12 @@ def _run_registration(
         _refresh_cancel_from_redis()
         with _lock:
             cur = _sessions.get(sid) or sess
+            bid = str(cur.get("batch_id") or "")
+            if bid:
+                bb = _batches.get(bid) or {}
+                if bb.get("cancel_requested") or _is_cancel_status(bb.get("status")):
+                    cur["cancel_requested"] = True
+                    _sessions[sid] = cur
         if _session_cancel_requested(cur):
             raise _RegCancelled(cur.get("message") or "cancelled by user")
 
@@ -1069,13 +1636,16 @@ def _run_registration(
             auto_fallback = True
 
         def _turnstile_progress(msg: str) -> None:
+            # Raise cancel out of solver polling so stop doesn't wait full captcha timeout.
             _check_cancel()
             update("solving_turnstile", f"Turnstile: {msg}")
 
         solver = YesCaptchaSolver(
             solver_key,
             endpoint=endpoint,
-            timeout=float(os.environ.get("GROK2API_YESCAPTCHA_TIMEOUT", "180") or 180),
+            # Keep captcha wait bounded; cancel still interrupts via on_progress.
+            timeout=float(os.environ.get("GROK2API_YESCAPTCHA_TIMEOUT", "120") or 120),
+            poll_interval=float(os.environ.get("GROK2API_YESCAPTCHA_POLL", "2") or 2),
             debug=True,
             on_progress=_turnstile_progress,
             # Local: no cloud fallback. YesCaptcha: allow cn/global peer fallback.
@@ -1097,13 +1667,25 @@ def _run_registration(
         solver_label = "本地过盾" if provider == "local" else "YesCaptcha"
         update("solving_turnstile", f"solving Turnstile via {solver_label} (before email code)")
         _check_cancel()
+
+        def _solve_turnstile(url: str, *, premium: bool = True) -> Any:
+            # Local inline solver is single-process and browser-backed; concurrent
+            # createTask storms from many registration workers cause timeouts /
+            # mixed results. Serialize local solves while keeping YesCaptcha parallel.
+            kwargs = {
+                "website_url": url,
+                "website_key": sitekey,
+                "premium": bool(premium),
+                "fallback_non_premium": True,
+            }
+            if provider == "local":
+                with _local_captcha_lock:
+                    _check_cancel()
+                    return solver.solve_turnstile(**kwargs)
+            return solver.solve_turnstile(**kwargs)
+
         try:
-            turnstile = solver.solve_turnstile(
-                website_url=website_url,
-                website_key=sitekey,
-                premium=True,
-                fallback_non_premium=True,
-            )
+            turnstile = _solve_turnstile(website_url, premium=True)
         except _RegCancelled:
             raise
         except Exception as captcha_err:
@@ -1115,12 +1697,7 @@ def _run_registration(
                 "solving_turnstile",
                 f"primary Turnstile failed ({captcha_err}); retry {alt_url}",
             )
-            turnstile = solver.solve_turnstile(
-                website_url=alt_url,
-                website_key=sitekey,
-                premium=False,
-                fallback_non_premium=True,
-            )
+            turnstile = _solve_turnstile(alt_url, premium=False)
         if not turnstile:
             raise RuntimeError("YesCaptcha returned empty Turnstile token")
         _check_cancel()
@@ -1139,21 +1716,34 @@ def _run_registration(
             )
 
         update("waiting_email", "waiting for xAI verification code")
-        # Poll mailbox in short slices so cancel is responsive during the wait.
-        code = None
-        mail_deadline = time.time() + 120.0
-        while time.time() < mail_deadline:
+        # Poll mailbox with cancel-aware receiver so stop lands in ~0.25–1s.
+        _check_cancel()
+
+        def _mail_should_cancel() -> bool:
+            # _check_cancel raises _RegCancelled when stop is requested.
             _check_cancel()
-            try:
-                # Prefer short wait if receiver supports timeout kw; fall back once.
-                code = receiver.wait_for_code(timeout=min(8.0, max(1.0, mail_deadline - time.time())))
-            except TypeError:
-                code = receiver.wait_for_code(timeout=120)
-                break
-            except Exception:
-                code = None
-            if code:
-                break
+            return False
+
+        try:
+            code = receiver.wait_for_code(
+                timeout=120.0,
+                should_cancel=_mail_should_cancel,
+                poll_interval=1.0,
+            )
+        except TypeError:
+            # Older receiver signature fallback.
+            code = None
+            mail_deadline = time.time() + 120.0
+            while time.time() < mail_deadline:
+                _check_cancel()
+                try:
+                    code = receiver.wait_for_code(
+                        timeout=min(4.0, max(1.0, mail_deadline - time.time()))
+                    )
+                except Exception:
+                    code = None
+                if code:
+                    break
         if not code:
             raise RuntimeError("email verification code timeout")
         code = str(code or "").strip().upper().replace(" ", "").replace("-", "")
@@ -1650,7 +2240,26 @@ def stop_registration_batch(batch_id: str) -> dict[str, Any]:
     batch = _load_reg_batch(bid)
     if not batch:
         return {"ok": False, "error": "registration batch not found"}
-    sids = list(batch.get("session_ids") or [])
+
+    # Mark batch cancelled FIRST so spawner/workers observe stop even before
+    # individual session mirrors catch up (multi-worker / Redis path).
+    with _lock:
+        b = _batches.get(bid) or dict(batch)
+        b["cancel_requested"] = True
+        if str(b.get("status") or "").lower() not in (
+            "done",
+            "partial",
+            "error",
+            "cancelled",
+            "stopped",
+        ):
+            b["status"] = "stopping"
+        b["message"] = "stop requested; signalling sessions"
+        b["updated_at"] = _now()
+        _batches[bid] = b
+        _mirror_reg_batch(bid, dict(b))
+        sids = list(b.get("session_ids") or [])
+
     stopped: list[str] = []
     already: list[str] = []
     missing: list[str] = []
@@ -1663,10 +2272,18 @@ def stop_registration_batch(batch_id: str) -> dict[str, Any]:
             already.append(str(sid))
         else:
             stopped.append(str(sid))
+
     with _lock:
         b = _batches.get(bid) or dict(batch)
         b["cancel_requested"] = True
-        b["status"] = "stopping"
+        if str(b.get("status") or "").lower() not in (
+            "done",
+            "partial",
+            "error",
+            "cancelled",
+            "stopped",
+        ):
+            b["status"] = "stopping"
         b["message"] = (
             f"stop requested: stopping={len(stopped)} "
             f"already_done={len(already)} missing={len(missing)}"
@@ -1681,6 +2298,7 @@ def stop_registration_batch(batch_id: str) -> dict[str, Any]:
         "stopped": stopped,
         "already_terminal": already,
         "missing": missing,
+        "message": out.get("message") or "stop requested",
         "batch": out,
     }
 
@@ -1776,18 +2394,26 @@ def list_registration_sessions() -> dict[str, Any]:
         batches = []
         for b in _batches.values():
             sids = list(b.get("session_ids") or [])
-            stats = _batch_stats(sids)
-            # If all sessions cancelled, surface batch as cancelled.
-            if sids and stats.get("running") == 0:
-                all_cancelled = True
-                for sid in sids:
-                    st = str((_load_reg_sess(sid) or {}).get("status") or "").lower()
-                    if st not in ("cancelled", "stopped"):
-                        all_cancelled = False
-                        break
-                if all_cancelled:
+            stats = _batch_stats(sids, batch=b)
+            # If all observed sessions cancelled, surface batch as cancelled.
+            if sids and stats.get("running") == 0 and stats.get("cancelled", 0) > 0:
+                if (
+                    stats.get("imported", 0) == 0
+                    and stats.get("error", 0) == 0
+                    and stats.get("missing", 0) == 0
+                ):
                     stats["batch_status"] = "cancelled"
-            batches.append({**b, **stats})
+            item = {**b, **stats}
+            # Align top-level status with computed batch_status for UI restore filters.
+            bst = str(stats.get("batch_status") or "").lower()
+            cur = str(b.get("status") or "").lower()
+            if bst and (
+                cur in ("", "running", "starting")
+                or (bst in ("done", "partial", "error", "cancelled", "stopped") and stats.get("running", 0) == 0)
+            ):
+                if cur != "stopping" or stats.get("running", 0) == 0:
+                    item["status"] = bst if bst != "running" or cur != "stopping" else cur
+            batches.append(item)
         batches.sort(
             key=lambda b: float(b.get("updated_at") or b.get("created_at") or 0),
             reverse=True,
@@ -1819,10 +2445,24 @@ def get_registration_session(
     return out
 
 
-def _batch_stats(session_ids: list[str]) -> dict[str, Any]:
-    imported = error = running = cancelled = 0
+def _batch_stats(
+    session_ids: list[str],
+    *,
+    batch: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compute batch counters from live sessions.
+
+    Missing sessions (TTL expired / not mirrored) are *not* treated as running —
+    that previously made finished historical batches look active after Redis
+    session keys aged out. When no live sessions remain, fall back to the
+    persisted batch status/message counters.
+    """
+    imported = error = running = cancelled = missing = 0
     for sid in session_ids:
-        sess = _load_reg_sess(sid) or {}
+        sess = _load_reg_sess(sid)
+        if not sess:
+            missing += 1
+            continue
         st = str(sess.get("status") or "").lower()
         if st in ("imported", "success", "completed"):
             imported += 1
@@ -1832,10 +2472,96 @@ def _batch_stats(session_ids: list[str]) -> dict[str, Any]:
             error += 1
         else:
             running += 1
+
     total = len(session_ids)
+    observed = imported + error + cancelled + running
     done = imported + error + cancelled
+    target = 0
+    if isinstance(batch, dict):
+        try:
+            target = int(batch.get("count") or 0)
+        except Exception:
+            target = 0
+    if target <= 0:
+        target = total
+
     status = "running"
-    if total and done >= total:
+    if observed == 0:
+        # No live sessions left — trust last mirrored batch status if terminal.
+        stored = ""
+        if isinstance(batch, dict):
+            stored = str(batch.get("batch_status") or batch.get("status") or "").lower()
+        if stored in ("done", "partial", "error", "cancelled", "stopped"):
+            status = stored
+            # Prefer stored counters when present so UI keeps final totals.
+            try:
+                imported = int(batch.get("imported") or imported)
+            except Exception:
+                pass
+            try:
+                error = int(batch.get("error") or error)
+            except Exception:
+                pass
+            try:
+                cancelled = int(batch.get("cancelled") or cancelled)
+            except Exception:
+                pass
+            try:
+                done = int(batch.get("done") or (imported + error + cancelled))
+            except Exception:
+                done = imported + error + cancelled
+            running = 0
+        elif total and missing >= total:
+            # All session keys gone and no terminal marker.
+            # Prefer counters / message fragments; never keep a fully-missing
+            # batch as "running" forever (ghost cards after Redis TTL).
+            msg = str((batch or {}).get("message") or "")
+            if isinstance(batch, dict):
+                try:
+                    imported = int(batch.get("imported") or imported or 0)
+                except Exception:
+                    pass
+                try:
+                    error = int(batch.get("error") or error or 0)
+                except Exception:
+                    pass
+                try:
+                    cancelled = int(batch.get("cancelled") or cancelled or 0)
+                except Exception:
+                    pass
+            # Parse "ok=N fail=M" style messages written by the spawner.
+            if imported == 0 and error == 0 and cancelled == 0 and msg:
+                import re as _re
+
+                m_ok = _re.search(r"ok\s*=\s*(\d+)", msg)
+                m_fail = _re.search(r"fail\s*=\s*(\d+)", msg)
+                if m_ok:
+                    try:
+                        imported = int(m_ok.group(1))
+                    except Exception:
+                        pass
+                if m_fail:
+                    try:
+                        error = int(m_fail.group(1))
+                    except Exception:
+                        pass
+            done = imported + error + cancelled
+            if cancelled and not imported and not error:
+                status = "cancelled"
+            elif imported and not error and not cancelled:
+                status = "done"
+            elif imported:
+                status = "partial"
+            elif error:
+                status = "error"
+            elif stored in ("stopping",):
+                status = "stopped"
+            else:
+                status = "done"
+            running = 0
+        else:
+            status = "running"
+    elif done >= max(target, total) and running == 0:
         if cancelled and not imported and not error:
             status = "cancelled"
         elif error == 0 and cancelled == 0:
@@ -1844,14 +2570,39 @@ def _batch_stats(session_ids: list[str]) -> dict[str, Any]:
             status = "partial"
         else:
             status = "error"
+    elif running == 0 and missing > 0 and done > 0 and observed < total:
+        # Partial visibility (some sessions expired) but nothing live.
+        if imported and (error or cancelled or missing):
+            status = "partial"
+        elif imported and not error and not cancelled:
+            status = "done"
+        elif cancelled and not imported and not error:
+            status = "cancelled"
+        elif error and not imported:
+            status = "error"
+        else:
+            status = "partial"
     elif total and (imported or error or cancelled) and running:
         status = "running"
+    elif running:
+        status = "running"
+
+    # Honour explicit cooperative stop marker on the batch itself.
+    if isinstance(batch, dict):
+        bst = str(batch.get("status") or "").lower()
+        if bst in ("stopping", "cancelled", "stopped") and running == 0:
+            if status == "running":
+                status = "cancelled" if cancelled or bst != "stopping" else "stopped"
+        if bst == "stopping" and running:
+            status = "running"
+
     return {
-        "total": total,
+        "total": max(total, target),
         "imported": imported,
         "error": error,
         "cancelled": cancelled,
         "running": running,
+        "missing": missing,
         "done": done,
         "batch_status": status,
     }
@@ -1862,13 +2613,34 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
     if not b:
         return None
     sids = list(b.get("session_ids") or [])
-    stats = _batch_stats(sids)
+    stats = _batch_stats(sids, batch=b)
+    # Keep response bounded for large batches: newest sessions first for UI.
+    MAX_BATCH_SESSIONS = 120
     sessions = []
-    for s in sids:
+    for s in sids[-MAX_BATCH_SESSIONS:]:
         sess = _load_reg_sess(s)
         if sess:
             sessions.append(_compact_session(sess))
-    return {**b, **stats, "sessions": sessions}
+    # Prefer recency if timestamps available.
+    try:
+        sessions.sort(
+            key=lambda s: float(s.get("updated_at") or s.get("created_at") or 0),
+            reverse=True,
+        )
+    except Exception:
+        pass
+    out = {**b, **stats, "sessions": sessions}
+    # Surface effective status for older UIs that only read `status`.
+    if stats.get("batch_status"):
+        # Don't clobber an explicit cooperative "stopping" marker while workers live.
+        if str(b.get("status") or "").lower() != "stopping" or stats.get("running", 0) == 0:
+            if stats.get("running", 0) == 0 or str(b.get("status") or "").lower() in (
+                "",
+                "running",
+                "starting",
+            ):
+                out["status"] = stats["batch_status"]
+    return out
 
 
 # --------------------------------------------------------------------------- #

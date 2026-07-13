@@ -3,19 +3,44 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Callable
 
 from store.pg import _ts, _unix, connection, json_dump, pg_enabled
+
+# Short process-local cache so every API request doesn't re-scan the whole
+# accounts table before the first upstream byte (large pools otherwise add
+# hundreds of ms of TTFT just reading auth).
+_auth_map_cache: dict[str, Any] | None = None
+_auth_map_cache_at = 0.0
+_auth_map_cache_lock = threading.RLock()
+_AUTH_MAP_CACHE_TTL = 2.0
 
 
 def enabled() -> bool:
     return pg_enabled()
 
 
+def invalidate_auth_map_cache() -> None:
+    global _auth_map_cache, _auth_map_cache_at
+    with _auth_map_cache_lock:
+        _auth_map_cache = None
+        _auth_map_cache_at = 0.0
+
+
 def read_auth_map() -> dict[str, Any]:
+    global _auth_map_cache, _auth_map_cache_at
     if not enabled():
         return {}
+    now = time.time()
+    with _auth_map_cache_lock:
+        if (
+            _auth_map_cache is not None
+            and now - _auth_map_cache_at < _AUTH_MAP_CACHE_TTL
+        ):
+            # Shallow copy is enough: callers treat entries as read-only snapshots.
+            return dict(_auth_map_cache)
     out: dict[str, Any] = {}
     with connection() as conn:
         with conn.cursor() as cur:
@@ -29,7 +54,69 @@ def read_auth_map() -> dict[str, Any]:
                         continue
                 if isinstance(payload, dict):
                     out[str(aid)] = payload
-    return out
+    with _auth_map_cache_lock:
+        _auth_map_cache = out
+        _auth_map_cache_at = time.time()
+        return dict(out)
+
+
+def read_auth_entry(account_id: str) -> tuple[str, dict[str, Any]] | None:
+    """O(1)-ish single-account read for sticky TTFT path.
+
+    Prefer process cache when hot; otherwise SELECT one row by id / user_id
+    instead of re-scanning the whole accounts table.
+    """
+    if not enabled() or not account_id:
+        return None
+    aid = str(account_id).strip()
+    if not aid:
+        return None
+    now = time.time()
+    with _auth_map_cache_lock:
+        if (
+            _auth_map_cache is not None
+            and now - _auth_map_cache_at < _AUTH_MAP_CACHE_TTL
+        ):
+            hit = _auth_map_cache.get(aid)
+            if isinstance(hit, dict):
+                return aid, dict(hit)
+            for k, v in _auth_map_cache.items():
+                if not isinstance(v, dict):
+                    continue
+                if (
+                    k == aid
+                    or v.get("user_id") == aid
+                    or v.get("principal_id") == aid
+                    or str(k).endswith(f"::{aid}")
+                ):
+                    return str(k), dict(v)
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, payload FROM accounts WHERE id = %s LIMIT 1",
+                (aid,),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.execute(
+                    """
+                    SELECT id, payload FROM accounts
+                    WHERE user_id = %s
+                       OR payload->>'user_id' = %s
+                       OR payload->>'principal_id' = %s
+                       OR id LIKE %s
+                    LIMIT 1
+                    """,
+                    (aid, aid, aid, f"%::{aid}"),
+                )
+                row = cur.fetchone()
+    if not row:
+        return None
+    rid, payload = str(row[0]), row[1]
+    decoded = _decode_payload(payload)
+    if not isinstance(decoded, dict):
+        return None
+    return rid, decoded
 
 
 def _decode_payload(payload: Any) -> dict[str, Any] | None:
@@ -285,6 +372,7 @@ def write_auth_map(data: dict[str, Any]) -> None:
                 cur.execute("DELETE FROM accounts WHERE id = %s", (aid,))
                 cur.execute("DELETE FROM account_pool WHERE account_id = %s", (aid,))
         conn.commit()
+    invalidate_auth_map_cache()
 
 
 def mutate_auth_map(mutator: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
@@ -315,6 +403,7 @@ def mutate_auth_map(mutator: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
                 cur.execute("DELETE FROM accounts WHERE id = %s", (aid,))
                 cur.execute("DELETE FROM account_pool WHERE account_id = %s", (aid,))
         conn.commit()
+    invalidate_auth_map_cache()
     return data
 
 
@@ -325,6 +414,7 @@ def upsert_account(account_id: str, entry: dict[str, Any]) -> None:
         with conn.cursor() as cur:
             _upsert_one(cur, account_id, entry)
         conn.commit()
+    invalidate_auth_map_cache()
 
 
 def upsert_account_merged(
@@ -386,6 +476,7 @@ def upsert_account_merged(
                 )
             _upsert_one(cur, account_id, entry)
         conn.commit()
+    invalidate_auth_map_cache()
     return account_id
 
 
@@ -398,6 +489,8 @@ def delete_account(account_id: str) -> bool:
             deleted = cur.rowcount > 0
             cur.execute("DELETE FROM account_pool WHERE account_id = %s", (account_id,))
         conn.commit()
+    if deleted:
+        invalidate_auth_map_cache()
     return deleted
 
 

@@ -291,10 +291,13 @@ def responses_request_to_chat_body(req: dict[str, Any], *, model: str) -> dict[s
     tools = convert_responses_tools(req.get("tools"))
     if tools:
         body["tools"] = tools
-    if req.get("tool_choice") is not None:
-        body["tool_choice"] = req.get("tool_choice")
-    if req.get("parallel_tool_calls") is not None:
-        body["parallel_tool_calls"] = bool(req.get("parallel_tool_calls"))
+        # Only forward tool_choice when tools survived conversion. Codex compact
+        # and pure-text Responses turns often set tool_choice without tools;
+        # upstream rejects that with 400 invalid-argument.
+        if req.get("tool_choice") is not None:
+            body["tool_choice"] = req.get("tool_choice")
+        if req.get("parallel_tool_calls") is not None:
+            body["parallel_tool_calls"] = bool(req.get("parallel_tool_calls"))
     if req.get("temperature") is not None:
         body["temperature"] = req.get("temperature")
     if req.get("top_p") is not None:
@@ -520,8 +523,42 @@ def build_responses_object(
     return obj
 
 
-def sse_event(event: str, payload: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+def sse_event(
+    event: str,
+    payload: dict[str, Any],
+    *,
+    sequence_number: int | None = None,
+) -> str:
+    """Format one Responses SSE frame.
+
+    OpenAI Responses stream events require a monotonic top-level
+    ``sequence_number`` (starting at 0). Clients such as the official SDK /
+    sub2api fail deserialization with ``missing field sequence_number`` when
+    it is absent.
+    """
+    body = dict(payload or {})
+    if "type" not in body and event:
+        body["type"] = event
+    if sequence_number is not None:
+        body["sequence_number"] = int(sequence_number)
+    elif "sequence_number" not in body:
+        # Defensive default: prefer explicit seq from callers, but never omit.
+        body["sequence_number"] = 0
+    return f"event: {event}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
+
+
+class _Seq:
+    """Tiny monotonic counter for Responses SSE sequence_number."""
+
+    __slots__ = ("n",)
+
+    def __init__(self, start: int = 0) -> None:
+        self.n = int(start)
+
+    def next(self) -> int:
+        cur = self.n
+        self.n += 1
+        return cur
 
 
 def iter_responses_sse_from_completion(
@@ -541,9 +578,15 @@ def iter_responses_sse_from_completion(
 
     Emits response.created → (text/tool events) → response.completed.
     Used when we collect upstream first (reliable terminal event for sub2api).
+    Every event includes a top-level ``sequence_number`` starting at 0.
     """
     created = int(created_at or time.time())
     frames: list[str] = []
+    seq = _Seq(0)
+
+    def emit(event: str, payload: dict[str, Any]) -> None:
+        frames.append(sse_event(event, payload, sequence_number=seq.next()))
+
     initial = {
         "id": response_id,
         "object": "response",
@@ -558,14 +601,10 @@ def iter_responses_sse_from_completion(
     if metadata:
         initial["metadata"] = metadata
 
-    frames.append(
-        sse_event("response.created", {"type": "response.created", "response": initial})
-    )
-    frames.append(
-        sse_event(
-            "response.in_progress",
-            {"type": "response.in_progress", "response": initial},
-        )
+    emit("response.created", {"type": "response.created", "response": initial})
+    emit(
+        "response.in_progress",
+        {"type": "response.in_progress", "response": initial},
     )
 
     output_index = 0
@@ -573,89 +612,77 @@ def iter_responses_sse_from_completion(
 
     if text:
         msg_id = new_output_item_id("msg")
-        frames.append(
-            sse_event(
-                "response.output_item.added",
-                {
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "id": msg_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "status": "in_progress",
-                        "content": [],
-                    },
+        emit(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
                 },
-            )
+            },
         )
-        frames.append(
-            sse_event(
-                "response.content_part.added",
-                {
-                    "type": "response.content_part.added",
-                    "item_id": msg_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": ""},
-                },
-            )
+        emit(
+            "response.content_part.added",
+            {
+                "type": "response.content_part.added",
+                "item_id": msg_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            },
         )
         # Emit text in small chunks so clients that only paint on delta still work.
         step = max(8, int(chunk_chars or 48))
         for i in range(0, len(text), step):
             delta = text[i : i + step]
-            frames.append(
-                sse_event(
-                    "response.output_text.delta",
-                    {
-                        "type": "response.output_text.delta",
-                        "item_id": msg_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "delta": delta,
-                    },
-                )
-            )
-        frames.append(
-            sse_event(
-                "response.output_text.done",
+            emit(
+                "response.output_text.delta",
                 {
-                    "type": "response.output_text.done",
+                    "type": "response.output_text.delta",
                     "item_id": msg_id,
                     "output_index": output_index,
                     "content_index": 0,
-                    "text": text,
+                    "delta": delta,
                 },
             )
+        emit(
+            "response.output_text.done",
+            {
+                "type": "response.output_text.done",
+                "item_id": msg_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "text": text,
+            },
         )
-        frames.append(
-            sse_event(
-                "response.content_part.done",
-                {
-                    "type": "response.content_part.done",
-                    "item_id": msg_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": text},
-                },
-            )
+        emit(
+            "response.content_part.done",
+            {
+                "type": "response.content_part.done",
+                "item_id": msg_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": text},
+            },
         )
-        frames.append(
-            sse_event(
-                "response.output_item.done",
-                {
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": {
-                        "id": msg_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": text}],
-                    },
+        emit(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text}],
                 },
-            )
+            },
         )
         output_index += 1
 
@@ -673,61 +700,53 @@ def iter_responses_sse_from_completion(
         if not call_id:
             call_id = f"call_{uuid.uuid4().hex[:24]}"
         fc_id = new_output_item_id("fc")
-        frames.append(
-            sse_event(
-                "response.output_item.added",
-                {
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "id": fc_id,
-                        "type": "function_call",
-                        "status": "in_progress",
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": "",
-                    },
+        emit(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": fc_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
                 },
-            )
+            },
         )
-        frames.append(
-            sse_event(
-                "response.function_call_arguments.delta",
-                {
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": fc_id,
-                    "output_index": output_index,
-                    "delta": args or "{}",
-                },
-            )
+        emit(
+            "response.function_call_arguments.delta",
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": fc_id,
+                "output_index": output_index,
+                "delta": args or "{}",
+            },
         )
-        frames.append(
-            sse_event(
-                "response.function_call_arguments.done",
-                {
-                    "type": "response.function_call_arguments.done",
-                    "item_id": fc_id,
-                    "output_index": output_index,
+        emit(
+            "response.function_call_arguments.done",
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": fc_id,
+                "output_index": output_index,
+                "arguments": args or "{}",
+            },
+        )
+        emit(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": {
+                    "id": fc_id,
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": name,
                     "arguments": args or "{}",
                 },
-            )
-        )
-        frames.append(
-            sse_event(
-                "response.output_item.done",
-                {
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": {
-                        "id": fc_id,
-                        "type": "function_call",
-                        "status": "completed",
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": args or "{}",
-                    },
-                },
-            )
+            },
         )
         output_index += 1
 
@@ -743,11 +762,9 @@ def iter_responses_sse_from_completion(
         previous_response_id=previous_response_id,
         metadata=metadata,
     )
-    frames.append(
-        sse_event(
-            "response.completed",
-            {"type": "response.completed", "response": final},
-        )
+    emit(
+        "response.completed",
+        {"type": "response.completed", "response": final},
     )
     # Some clients also accept OpenAI-style done sentinel after events.
     frames.append("data: [DONE]\n\n")
@@ -760,8 +777,10 @@ def failed_responses_sse(
     message: str,
     err_type: str = "server_error",
 ) -> list[str]:
+    """Emit a terminal response.failed event with sequence_number=0."""
     payload = {
         "type": "response.failed",
+        "sequence_number": 0,
         "response": {
             "id": response_id,
             "object": "response",
@@ -769,4 +788,521 @@ def failed_responses_sse(
             "error": {"type": err_type, "message": message},
         },
     }
-    return [sse_event("response.failed", payload), "data: [DONE]\n\n"]
+    return [
+        sse_event("response.failed", payload, sequence_number=0),
+        "data: [DONE]\n\n",
+    ]
+
+
+class ResponsesLiveStreamer:
+    """Incremental Responses SSE encoder for true first-token streaming.
+
+    Emits response.created immediately, then text/tool events as upstream
+    deltas arrive. This avoids the old collect-then-replay path that made
+    /v1/responses TTFT equal to full completion latency.
+    """
+
+    def __init__(
+        self,
+        *,
+        response_id: str,
+        model: str,
+        created_at: int | None = None,
+        previous_response_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.response_id = response_id
+        self.model = model
+        self.created_at = int(created_at or time.time())
+        self.previous_response_id = previous_response_id
+        self.metadata = metadata if isinstance(metadata, dict) else None
+        self._seq = _Seq(0)
+        self._started = False
+        self._text_open = False
+        self._msg_id: str | None = None
+        self._text_parts: list[str] = []
+        self._tools: dict[int, dict[str, Any]] = {}
+        self._tool_opened: set[int] = set()
+        self._tool_done: set[int] = set()
+        self._output_index = 0
+        self._text_output_index = 0
+        self._closed = False
+
+    def _emit(self, event: str, payload: dict[str, Any]) -> str:
+        return sse_event(event, payload, sequence_number=self._seq.next())
+
+    def _initial_response(self) -> dict[str, Any]:
+        obj: dict[str, Any] = {
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": "in_progress",
+            "model": self.model,
+            "output": [],
+            "usage": chat_usage_to_responses_usage(None),
+        }
+        if self.previous_response_id:
+            obj["previous_response_id"] = self.previous_response_id
+        if self.metadata:
+            obj["metadata"] = self.metadata
+        return obj
+
+    def start(self) -> list[str]:
+        if self._started:
+            return []
+        self._started = True
+        initial = self._initial_response()
+        return [
+            self._emit(
+                "response.created",
+                {"type": "response.created", "response": initial},
+            ),
+            self._emit(
+                "response.in_progress",
+                {"type": "response.in_progress", "response": initial},
+            ),
+        ]
+
+    def _ensure_text_open(self) -> list[str]:
+        if self._text_open:
+            return []
+        self._text_open = True
+        self._msg_id = new_output_item_id("msg")
+        self._text_output_index = self._output_index
+        frames = [
+            self._emit(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": self._text_output_index,
+                    "item": {
+                        "id": self._msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                    },
+                },
+            ),
+            self._emit(
+                "response.content_part.added",
+                {
+                    "type": "response.content_part.added",
+                    "item_id": self._msg_id,
+                    "output_index": self._text_output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": ""},
+                },
+            ),
+        ]
+        self._output_index += 1
+        return frames
+
+    def on_text_delta(self, delta: str) -> list[str]:
+        if not delta or self._closed:
+            return []
+        frames = self.start()
+        frames.extend(self._ensure_text_open())
+        self._text_parts.append(delta)
+        frames.append(
+            self._emit(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": self._msg_id,
+                    "output_index": self._text_output_index,
+                    "content_index": 0,
+                    "delta": delta,
+                },
+            )
+        )
+        return frames
+
+    def _tool_slot(self, index: int) -> dict[str, Any]:
+        slot = self._tools.get(index)
+        if slot is None:
+            slot = {
+                "id": new_output_item_id("fc"),
+                "call_id": "",
+                "name": "",
+                "arguments": "",
+                "output_index": None,
+                "args_emitted": False,
+            }
+            self._tools[index] = slot
+        return slot
+
+    def _merge_tool_name(self, current: str, incoming: str) -> str:
+        cur = (current or "").strip()
+        inc = (incoming or "").strip()
+        if not inc:
+            return cur
+        if not cur:
+            return inc
+        # True suffix fragment.
+        if inc.startswith(cur):
+            return inc
+        if cur.endswith(inc):
+            return cur
+        if inc in cur:
+            return cur
+        return cur + inc
+
+    def _merge_tool_args(self, current: str, incoming: str) -> str:
+        """Merge streamed tool args without double-append corruption.
+
+        Secondary relays often re-send cumulative JSON. Always-append would
+        produce `{"file_path":"a"}{"file_path":"a"}` and Claude Code Read fails
+        with missing required fields after parse.
+        """
+        try:
+            import anthropic_compat as anth
+
+            return anth.merge_tool_argument_delta(current or "", incoming or "")
+        except Exception:
+            cur = current or ""
+            inc = incoming or ""
+            if not inc:
+                return cur
+            if not cur:
+                return inc
+            if inc.startswith(cur):
+                return inc
+            if cur.endswith(inc) or inc in cur:
+                return cur
+            return cur + inc
+
+    def _args_ready(self, args: str) -> bool:
+        try:
+            import anthropic_compat as anth
+
+            return bool(anth.is_complete_tool_arguments_json(args or ""))
+        except Exception:
+            text = str(args or "").strip()
+            if not text or text[0] not in "{[":
+                return False
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return False
+            return isinstance(parsed, (dict, list)) and parsed not in ({}, [])
+
+    def _emit_ready_tools(self) -> list[str]:
+        """Emit at most one complete tool at a time (name + full JSON args).
+
+        Critical for Claude Code via sub2api:
+        - Hold until arguments are complete non-empty JSON object/array.
+        - Never stream argument suffixes live (Read.file_path must arrive whole).
+        - Never open tool N+1 while tool N is unfinished.
+        """
+        frames: list[str] = []
+        for idx in sorted(self._tools.keys()):
+            if idx in self._tool_done:
+                continue
+            slot = self._tools[idx]
+            name = (slot.get("name") or "").strip()
+            args = slot.get("arguments") or ""
+            # Do not overtake a lower unfinished tool.
+            blocked = False
+            for lower in range(0, idx):
+                if lower in self._tool_done:
+                    continue
+                low = self._tools.get(lower)
+                if not low:
+                    continue
+                if (low.get("name") or low.get("call_id") or str(low.get("arguments") or "").strip()):
+                    blocked = True
+                    break
+            if blocked:
+                break
+            if not name:
+                # Known id/args without name — keep holding this slot.
+                if slot.get("call_id") or str(args).strip():
+                    break
+                continue
+            if not self._args_ready(args):
+                break
+            # Open + emit full args + close in one burst (atomic for converters).
+            if idx not in self._tool_opened:
+                if not slot.get("call_id"):
+                    slot["call_id"] = f"call_{uuid.uuid4().hex[:24]}"
+                slot["output_index"] = self._output_index
+                self._output_index += 1
+                self._tool_opened.add(idx)
+                frames.append(
+                    self._emit(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": slot["output_index"],
+                            "item": {
+                                "id": slot["id"],
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "call_id": slot["call_id"],
+                                "name": name,
+                                "arguments": "",
+                            },
+                        },
+                    )
+                )
+            if not slot.get("args_emitted"):
+                frames.append(
+                    self._emit(
+                        "response.function_call_arguments.delta",
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": slot["id"],
+                            "output_index": slot["output_index"],
+                            "delta": args,
+                        },
+                    )
+                )
+                slot["args_emitted"] = True
+            frames.append(
+                self._emit(
+                    "response.function_call_arguments.done",
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": slot["id"],
+                        "output_index": slot["output_index"],
+                        "arguments": args,
+                    },
+                )
+            )
+            frames.append(
+                self._emit(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": slot["output_index"],
+                        "item": {
+                            "id": slot["id"],
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": slot.get("call_id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "name": name,
+                            "arguments": args,
+                        },
+                    },
+                )
+            )
+            self._tool_done.add(idx)
+            # One complete tool per on_tool_delta tick — let converters settle.
+            break
+        return frames
+
+    def on_tool_delta(self, tool_calls: list[dict[str, Any]] | None) -> list[str]:
+        if not tool_calls or self._closed:
+            return []
+        frames = self.start()
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            try:
+                idx = int(tc.get("index") if tc.get("index") is not None else 0)
+            except (TypeError, ValueError):
+                idx = 0
+            slot = self._tool_slot(idx)
+            if tc.get("id"):
+                slot["call_id"] = str(tc.get("id"))
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            if fn.get("name"):
+                slot["name"] = self._merge_tool_name(slot.get("name") or "", str(fn.get("name") or ""))
+            if fn.get("arguments") is not None:
+                args_piece = fn.get("arguments")
+                if not isinstance(args_piece, str):
+                    args_piece = _stringify(args_piece)
+                slot["arguments"] = self._merge_tool_args(slot.get("arguments") or "", args_piece or "")
+            elif tc.get("arguments") is not None:
+                args_piece = tc.get("arguments")
+                if not isinstance(args_piece, str):
+                    args_piece = _stringify(args_piece)
+                slot["arguments"] = self._merge_tool_args(slot.get("arguments") or "", args_piece or "")
+        # Only emit tools whose name+complete JSON args are ready.
+        frames.extend(self._emit_ready_tools())
+        return frames
+
+    def _close_open_text(self) -> list[str]:
+        if not self._text_open or not self._msg_id:
+            return []
+        text = "".join(self._text_parts)
+        frames = [
+            self._emit(
+                "response.output_text.done",
+                {
+                    "type": "response.output_text.done",
+                    "item_id": self._msg_id,
+                    "output_index": self._text_output_index,
+                    "content_index": 0,
+                    "text": text,
+                },
+            ),
+            self._emit(
+                "response.content_part.done",
+                {
+                    "type": "response.content_part.done",
+                    "item_id": self._msg_id,
+                    "output_index": self._text_output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": text},
+                },
+            ),
+            self._emit(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": self._text_output_index,
+                    "item": {
+                        "id": self._msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": text}],
+                    },
+                },
+            ),
+        ]
+        self._text_open = False
+        return frames
+
+    def _close_open_tools(self) -> list[str]:
+        """Flush any still-held tools at stream end (best-effort complete JSON)."""
+        frames: list[str] = []
+        # Prefer the readiness path first (complete JSON only).
+        while True:
+            more = self._emit_ready_tools()
+            if not more:
+                break
+            frames.extend(more)
+        # Terminal flush: emit remaining known tools even if args incomplete.
+        for idx in sorted(self._tools.keys()):
+            if idx in self._tool_done:
+                continue
+            slot = self._tools.get(idx) or {}
+            name = (slot.get("name") or "").strip()
+            args = slot.get("arguments") or ""
+            if not name and not slot.get("call_id") and not str(args).strip():
+                continue
+            if not name:
+                continue
+            if not str(args).strip():
+                args = "{}"
+            if idx not in self._tool_opened:
+                if not slot.get("call_id"):
+                    slot["call_id"] = f"call_{uuid.uuid4().hex[:24]}"
+                slot["output_index"] = self._output_index
+                self._output_index += 1
+                self._tool_opened.add(idx)
+                frames.append(
+                    self._emit(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": slot["output_index"],
+                            "item": {
+                                "id": slot["id"],
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "call_id": slot["call_id"],
+                                "name": name,
+                                "arguments": "",
+                            },
+                        },
+                    )
+                )
+            out_idx = slot.get("output_index")
+            if out_idx is None:
+                continue
+            if not slot.get("args_emitted"):
+                frames.append(
+                    self._emit(
+                        "response.function_call_arguments.delta",
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": slot.get("id"),
+                            "output_index": out_idx,
+                            "delta": args,
+                        },
+                    )
+                )
+                slot["args_emitted"] = True
+            frames.append(
+                self._emit(
+                    "response.function_call_arguments.done",
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": slot.get("id"),
+                        "output_index": out_idx,
+                        "arguments": args,
+                    },
+                )
+            )
+            frames.append(
+                self._emit(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": out_idx,
+                        "item": {
+                            "id": slot.get("id"),
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": slot.get("call_id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "name": name,
+                            "arguments": args,
+                        },
+                    },
+                )
+            )
+            self._tool_done.add(idx)
+        return frames
+
+    def complete(
+        self,
+        *,
+        usage: dict[str, Any] | None = None,
+        reasoning: str = "",
+    ) -> list[str]:
+        if self._closed:
+            return []
+        frames = self.start()
+        frames.extend(self._close_open_text())
+        frames.extend(self._close_open_tools())
+        # Build terminal response object for clients that only read completed.
+        tool_calls: list[dict[str, Any]] = []
+        for idx in sorted(self._tools.keys()):
+            slot = self._tools[idx]
+            if not slot.get("name") and not slot.get("arguments"):
+                continue
+            tool_calls.append(
+                {
+                    "id": slot.get("call_id") or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": slot.get("name") or "",
+                        "arguments": slot.get("arguments") or "{}",
+                    },
+                }
+            )
+        final = build_responses_object(
+            response_id=self.response_id,
+            model=self.model,
+            content="".join(self._text_parts),
+            reasoning=reasoning or "",
+            tool_calls=tool_calls or None,
+            usage=usage,
+            status="completed",
+            created_at=self.created_at,
+            previous_response_id=self.previous_response_id,
+            metadata=self.metadata,
+        )
+        frames.append(
+            self._emit(
+                "response.completed",
+                {"type": "response.completed", "response": final},
+            )
+        )
+        frames.append("data: [DONE]\n\n")
+        self._closed = True
+        return frames

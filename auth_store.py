@@ -96,6 +96,24 @@ def auth_lock(timeout: float = 10.0) -> Iterator[None]:
             yield
 
 
+def _invalidate_live_credentials_cache() -> None:
+    try:
+        from auth import invalidate_live_credentials_cache
+
+        invalidate_live_credentials_cache()
+    except Exception:
+        pass
+
+
+def _invalidate_live_credentials_cache() -> None:
+    try:
+        from auth import invalidate_live_credentials_cache
+
+        invalidate_live_credentials_cache()
+    except Exception:
+        pass
+
+
 def _invalidate_cache(path: Path | None = None) -> None:
     global _cache_path, _cache_mtime_ns, _cache_data, _cache_stat_at
     with _cache_lock:
@@ -104,6 +122,8 @@ def _invalidate_cache(path: Path | None = None) -> None:
             _cache_mtime_ns = None
             _cache_data = None
             _cache_stat_at = 0.0
+    # Account map changed (or may have): drop request-path live credential cache.
+    _invalidate_live_credentials_cache()
 
 
 def _set_cache(path: Path, data: dict[str, Any], mtime_ns: int | None) -> None:
@@ -203,6 +223,44 @@ def read_auth_map(path: Path | None = None) -> dict[str, Any]:
             data = {}
         _set_cache(path, data, _path_mtime_ns(path))
         return dict(data)
+
+
+def read_auth_entry(
+    account_id: str, path: Path | None = None
+) -> tuple[str, dict[str, Any]] | None:
+    """Load one account entry without scanning the whole pool when possible."""
+    if not account_id:
+        return None
+    path = path or AUTH_FILE
+    aid = str(account_id).strip()
+    if not aid:
+        return None
+    if path == AUTH_FILE or path.resolve() == AUTH_FILE.resolve():
+        pg = _pg_accounts()
+        if pg is not None:
+            try:
+                hit = pg.read_auth_entry(aid)
+                if hit is not None:
+                    return hit
+            except Exception:
+                pass  # fall through to full map / file
+    data = read_auth_map(path)
+    if not isinstance(data, dict) or not data:
+        return None
+    hit = data.get(aid)
+    if isinstance(hit, dict):
+        return aid, hit
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        if (
+            k == aid
+            or v.get("user_id") == aid
+            or v.get("principal_id") == aid
+            or str(k).endswith(f"::{aid}")
+        ):
+            return str(k), v
+    return None
 
 
 def _write_auth_file(data: dict[str, Any], path: Path) -> None:

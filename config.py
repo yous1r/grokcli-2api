@@ -210,6 +210,11 @@ MOEMAIL_BASE_URL = os.getenv("GROK2API_MOEMAIL_BASE_URL", "https://moemail.examp
 MOEMAIL_API_KEY = os.getenv("GROK2API_MOEMAIL_API_KEY", "")
 MOEMAIL_DOMAIN = os.getenv("GROK2API_MOEMAIL_DOMAIN", "example.com")
 MOEMAIL_EXPIRY_MS = int(os.getenv("GROK2API_MOEMAIL_EXPIRY_MS", "3600000"))
+# Temp-mail provider for protocol registration:
+# moemail | yyds (vip.215.im) | gptmail (mail.chatgpt.org.uk)
+MAIL_PROVIDER = (
+    os.getenv("GROK2API_MAIL_PROVIDER") or os.getenv("MAIL_PROVIDER") or "moemail"
+).strip().lower() or "moemail"
 # Auto-refresh access tokens this many seconds before expiry
 TOKEN_REFRESH_SKEW = float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "120"))
 

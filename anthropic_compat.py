@@ -450,9 +450,11 @@ def build_openai_chat_body(
     tools = anthropic_tools_to_openai(req.tools)
     if tools:
         body["tools"] = tools
-    tc = anthropic_tool_choice_to_openai(req.tool_choice)
-    if tc is not None:
-        body["tool_choice"] = tc
+        # Never send tool_choice without tools — upstream 400:
+        # "A tool_choice was set on the request but no tools were specified."
+        tc = anthropic_tool_choice_to_openai(req.tool_choice)
+        if tc is not None:
+            body["tool_choice"] = tc
     if req.temperature is not None:
         body["temperature"] = req.temperature
     if req.top_p is not None:

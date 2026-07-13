@@ -12,10 +12,20 @@ import threading
 import time
 from typing import Any
 
-from auth import AuthError, GrokCredentials, list_live_credentials, load_credentials_by_id
+from auth import (
+    AuthError,
+    GrokCredentials,
+    get_cached_live_credentials,
+    list_live_credentials,
+    load_credentials_by_id,
+    peek_credentials_by_id,
+)
 from settings_store import (
     get_account_mode,
+    get_account_pool_meta,
+    get_account_pool_meta_many,
     get_account_pool_state,
+    get_cached_account_pool_state,
     patch_account_pool_meta,
     save_account_pool_state,
     touch_account_stats,
@@ -63,7 +73,9 @@ SERVER_ERROR_COOLDOWN = 20
 SOFT_MODEL_BLOCK_TTL = 180.0  # free-usage soft block default
 # Durable model unavailability: keep account out of this model until probe recovers.
 DURABLE_MODEL_BLOCK_TTL = 3600.0
-MAX_FAILOVER_ATTEMPTS = 8  # cap chain length so one bad wave doesn't thrash whole pool
+# Keep short for TTFT: long chains mainly help after first failure, but inflate
+# pick work / sticky reordering on every request for large pools.
+MAX_FAILOVER_ATTEMPTS = 4
 COOLDOWN_MAX = 600.0  # hard ceiling for any adaptive cooldown
 COOLDOWN_JITTER_RATIO = 0.15  # +/-15% jitter to desync herd recovery
 # Probe / request fail streak → temporary kick, then hard disable from pool.
@@ -279,26 +291,43 @@ def apply_free_usage_cooldown(
     }
 
 
+# Short process-local cache for pool policy knobs. First _get_setting_value after
+# a worker starts can cost hundreds of ms (settings hydrate); request TTFT must
+# not pay that on every sticky pick.
+_policy_cache: dict[str, tuple[float, float]] = {}
+_POLICY_CACHE_TTL = 5.0
+
+
 def _policy_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 3600.0) -> float:
     """Read a numeric pool policy from settings store, else env, else default."""
+    now = time.time()
+    hit = _policy_cache.get(name)
+    if hit is not None and now - hit[0] < _POLICY_CACHE_TTL:
+        return max(minimum, min(maximum, float(hit[1])))
+    val: float | None = None
     try:
         from settings_store import _get_setting_value
 
         raw = _get_setting_value(name, None)
         if raw is not None and str(raw).strip() != "":
-            return max(minimum, min(maximum, float(raw)))
+            val = float(raw)
     except Exception:
-        pass
-    import os
+        val = None
+    if val is None:
+        import os
 
-    env_key = "GROK2API_" + name.upper()
-    raw = os.getenv(env_key)
-    if raw is not None and str(raw).strip() != "":
-        try:
-            return max(minimum, min(maximum, float(raw)))
-        except (TypeError, ValueError):
-            pass
-    return max(minimum, min(maximum, float(default)))
+        env_key = "GROK2API_" + name.upper()
+        raw = os.getenv(env_key)
+        if raw is not None and str(raw).strip() != "":
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                val = None
+    if val is None:
+        val = float(default)
+    clamped = max(minimum, min(maximum, float(val)))
+    _policy_cache[name] = (now, clamped)
+    return clamped
 
 
 def _policy_int(name: str, default: int, *, minimum: int = 0, maximum: int = 10_000) -> int:
@@ -463,7 +492,12 @@ def prune_expired_model_blocks(account_id: str | None = None) -> int:
     return removed
 
 
-def _pool_meta(account_id: str, state: dict[str, Any]) -> dict[str, Any]:
+def _pool_meta(
+    account_id: str,
+    state: dict[str, Any],
+    *,
+    redis_overlay: bool = True,
+) -> dict[str, Any]:
     meta = state.get(account_id) or {}
     if not isinstance(meta, dict):
         meta = {}
@@ -524,7 +558,10 @@ def _pool_meta(account_id: str, state: dict[str, Any]) -> dict[str, Any]:
     }
     # Overlay Redis hot counters / cooldowns when multi-worker store is on.
     # Durable account-bound status remains authoritative.
-    if account_id:
+    # IMPORTANT: request-path account picking must pass redis_overlay=False.
+    # merge_pool_meta does per-account Redis HGETALL/GET and costs multi-seconds
+    # on 1k+ pools (dominant TTFT pick latency).
+    if account_id and redis_overlay:
         try:
             from store.pool_redis import merge_pool_meta
 
@@ -564,6 +601,7 @@ def is_model_blocked(
     state: dict[str, Any] | None = None,
     *,
     durable_only: bool = False,
+    meta: dict[str, Any] | None = None,
 ) -> bool:
     """True if this account must not be scheduled for `model`.
 
@@ -575,9 +613,11 @@ def is_model_blocked(
     """
     if not account_id or not model:
         return False
-    if state is None:
-        state = get_account_pool_state()
-    meta = _pool_meta(account_id, state)
+    if meta is None:
+        if state is None:
+            state = get_account_pool_state()
+        # Scheduling decisions use durable PG/file meta only (no Redis fan-out).
+        meta = _pool_meta(account_id, state, redis_overlay=False)
     blocked = meta.get("blocked_models") or {}
     if not isinstance(blocked, dict) or model not in blocked:
         return False
@@ -761,16 +801,23 @@ def _eligible(
     state: dict[str, Any],
     *,
     model: str | None = None,
+    allow_refreshable_expired: bool = False,
+    redis_overlay: bool = False,
 ) -> bool:
-    if creds.expired:
+    # Expired access tokens are normally ineligible. When the caller will
+    # immediately refresh (acquire path), keep accounts that still have a
+    # refresh_token so auto-renew can revive them instead of reporting
+    # "all expired".
+    if creds.expired and not (allow_refreshable_expired and creds.refresh_token):
         return False
     aid = creds.auth_key or ""
-    meta = _pool_meta(aid, state)
+    # Request-path scheduling uses durable meta only (no per-account Redis).
+    meta = _pool_meta(aid, state, redis_overlay=redis_overlay)
     if not meta["enabled"]:
         return False
     if is_in_cooldown(meta):
         return False
-    if model and is_model_blocked(aid, model, state):
+    if model and is_model_blocked(aid, model, state, meta=meta):
         return False
     return True
 
@@ -870,9 +917,12 @@ def acquire(
 
     _ensure_multi_account_layout()
 
-    # Read-only callers disable refresh so a stalled OIDC exchange cannot
-    # monopolize Uvicorn's event-loop thread.
-    all_live = list_live_credentials(include_expired=False, auto_refresh=auto_refresh)
+    # Never network-refresh the whole pool here. Selection is pure local filtering;
+    # only the single picked account is refreshed (if already expired).
+    all_live = list_live_credentials(
+        include_expired=bool(auto_refresh),
+        auto_refresh=False,
+    )
     if not all_live:
         raise AuthError(
             "No live accounts in auth store. "
@@ -889,49 +939,76 @@ def acquire(
         pass
     candidates = [c for c in all_live if (c.auth_key or "") not in exclude]
 
-    eligible = [c for c in candidates if _eligible(c, state, model=model)]
+    eligible = [
+        c
+        for c in candidates
+        if _eligible(
+            c,
+            state,
+            model=model,
+            allow_refreshable_expired=bool(auto_refresh),
+            redis_overlay=False,
+        )
+    ]
     # Soft recovery ladder — never hard-fail light API calls while any enabled
     # live account still exists. Agent frontends treat empty-pool as "stop".
+    def _usable(c: GrokCredentials) -> bool:
+        return (not c.expired) or (bool(auto_refresh) and bool(c.refresh_token))
+
+    def _meta_local(c: GrokCredentials) -> dict[str, Any]:
+        return _pool_meta(c.auth_key or "", state, redis_overlay=False)
+
     if not eligible:
         # 1) ignore cooldown, still honor model soft/hard blocks
-        eligible = [
-            c
-            for c in candidates
-            if not c.expired
-            and _pool_meta(c.auth_key or "", state)["enabled"]
-            and not (model and is_model_blocked(c.auth_key or "", model, state))
-        ]
+        eligible = []
+        for c in candidates:
+            if not _usable(c):
+                continue
+            meta = _meta_local(c)
+            if not meta.get("enabled", True):
+                continue
+            if model and is_model_blocked(c.auth_key or "", model, state, meta=meta):
+                continue
+            eligible.append(c)
     if not eligible:
         # 2) also ignore temporary model soft-blocks (keep durable permanent blocks)
-        eligible = [
-            c
-            for c in candidates
-            if not c.expired
-            and _pool_meta(c.auth_key or "", state)["enabled"]
-            and not (model and is_model_blocked(c.auth_key or "", model, state, durable_only=True))
-        ]
+        eligible = []
+        for c in candidates:
+            if not _usable(c):
+                continue
+            meta = _meta_local(c)
+            if not meta.get("enabled", True):
+                continue
+            if model and is_model_blocked(
+                c.auth_key or "", model, state, durable_only=True, meta=meta
+            ):
+                continue
+            eligible.append(c)
     if not eligible:
         # 3) last resort: any enabled live account (even permanent model block)
         # Prefer trying over returning AuthError — upstream may have recovered.
         eligible = [
             c
             for c in candidates
-            if not c.expired and _pool_meta(c.auth_key or "", state)["enabled"]
+            if _usable(c) and _meta_local(c).get("enabled", True)
         ]
     if not eligible and candidates:
         # 4) absolute last resort: any live candidate (disabled only if quota-disabled still skipped)
         eligible = [
             c
             for c in candidates
-            if not c.expired
-            and not _pool_meta(c.auth_key or "", state).get("disabled_for_quota")
+            if _usable(c) and not _meta_local(c).get("disabled_for_quota")
         ]
-    if eligible and not any(_eligible(c, state, model=model) for c in candidates):
+    if eligible and not any(
+        _eligible(c, state, model=model, redis_overlay=False) for c in candidates
+    ):
         # We are in soft-recovery mode: prefer soonest-ready / healthiest.
         try:
             def _cd_key(c: GrokCredentials) -> tuple[int, float, float]:
-                meta = _pool_meta(c.auth_key or "", state)
-                blocked = 1 if (model and is_model_blocked(c.auth_key or "", model, state)) else 0
+                meta = _meta_local(c)
+                blocked = 1 if (
+                    model and is_model_blocked(c.auth_key or "", model, state, meta=meta)
+                ) else 0
                 try:
                     until = float(meta.get("cooldown_until") or 0)
                 except Exception:
@@ -943,10 +1020,14 @@ def acquire(
         if mode in ("random", "least_used") and len(eligible) > 3:
             window = eligible[: max(3, min(12, len(eligible) // 4 or 3))]
             if mode == "random":
-                return _pick_random(window, state)
-            return _pick_least_used(window, state)
+                return _ensure_fresh_creds(
+                    _pick_random(window, state), auto_refresh=auto_refresh
+                )
+            return _ensure_fresh_creds(
+                _pick_least_used(window, state), auto_refresh=auto_refresh
+            )
         if eligible:
-            return eligible[0]
+            return _ensure_fresh_creds(eligible[0], auto_refresh=auto_refresh)
     if not eligible:
         msg = "No eligible accounts (all disabled, expired, excluded"
         if model:
@@ -955,12 +1036,14 @@ def acquire(
         raise AuthError(msg)
 
     if mode == "round_robin":
-        return _pick_round_robin(eligible)
-    if mode == "random":
-        return _pick_random(eligible, state)
-    if mode == "least_used":
-        return _pick_least_used(eligible, state)
-    return eligible[0]
+        picked = _pick_round_robin(eligible)
+    elif mode == "random":
+        picked = _pick_random(eligible, state)
+    elif mode == "least_used":
+        picked = _pick_least_used(eligible, state)
+    else:
+        picked = eligible[0]
+    return _ensure_fresh_creds(picked, auto_refresh=auto_refresh)
 
 
 def report_success(account_id: str | None, *, model: str | None = None) -> None:
@@ -1568,6 +1651,31 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
     return out
 
 
+def _ensure_fresh_creds(
+    creds: GrokCredentials,
+    *,
+    auto_refresh: bool = True,
+) -> GrokCredentials:
+    """Refresh only the selected account when access token is expired.
+
+    Near-expiry is left to background token_maintainer so request TTFT is not
+    blocked by an OIDC round-trip on every call. Hard-expired tokens still
+    refresh on demand (otherwise the request cannot succeed).
+    """
+    if not auto_refresh or not creds or not creds.auth_key:
+        return creds
+    # Only pay the OIDC cost when the access token is already unusable.
+    if not creds.expired:
+        return creds
+    if not creds.refresh_token:
+        return creds
+    try:
+        return load_credentials_by_id(creds.auth_key)
+    except Exception:
+        # Keep original; caller/upstream will fail over if still expired.
+        return creds
+
+
 def try_acquire_sequence(
     max_attempts: int | None = None,
     *,
@@ -1581,44 +1689,271 @@ def try_acquire_sequence(
     `prefer_account_id`: conversation affinity — put this account first so
     multi-turn chats stay on the same account (memory continuity), unless it is
     cooling / model-blocked (then it stays in the chain but not forced first).
+
+    Sticky multi-turn fast path: when prefer_account is ready/fresh, skip the
+    full-pool scan and return a short chain (sticky first). Compatibility is
+    unchanged — failover still works via the short backup list built only if
+    sticky is unusable.
     """
     _ensure_multi_account_layout()
-    mode = get_account_mode()
-    all_live = list_live_credentials(include_expired=False, auto_refresh=True)
-    state = get_account_pool_state()
-    enabled = [
-        c
-        for c in all_live
-        if _pool_meta(c.auth_key or "", state)["enabled"]
-        and not (model and is_model_blocked(c.auth_key or "", model, state))
-    ]
-    if not enabled:
-        # ignore temporary model soft-blocks (free-usage) so light calls still work
-        enabled = [
-            c
-            for c in all_live
-            if _pool_meta(c.auth_key or "", state)["enabled"]
-            and not (
+
+    # ── Sticky affinity fast path (dominant multi-turn TTFT win) ──────────
+    # Load only the preferred account + durable meta. Avoid list_live over
+    # 1k accounts and full account_pool SELECT when the conversation is pinned.
+    # Intentionally avoid max_failover_attempts()/settings hydrate here — first
+    # policy read after a worker starts can cost hundreds of ms.
+    if prefer_account_id:
+        sticky = peek_credentials_by_id(prefer_account_id)
+        if sticky is not None and sticky.auth_key:
+            # Single-row meta — never full-pool state on the sticky hot path.
+            sm_raw = get_account_pool_meta(sticky.auth_key or "")
+            sticky_state = {sticky.auth_key or "": sm_raw}
+            sm = _pool_meta(sticky.auth_key or "", sticky_state, redis_overlay=False)
+            sticky_blocked = bool(
                 model
                 and is_model_blocked(
-                    c.auth_key or "", model, state, durable_only=True
+                    sticky.auth_key or "", model, sticky_state, meta=sm
                 )
             )
-        ]
+            # CRITICAL for TTFT: never OIDC-refresh on the sticky hot path.
+            # Expired sticky accounts fall through to the full picker, which
+            # prefers already-fresh tokens and only refreshes the first
+            # candidate when necessary. Request-path RT exchange was the
+            # main reason live sticky picks still showed 150–300ms.
+            sticky_ready = (
+                bool(sm.get("enabled", True))
+                and not sm.get("disabled_for_quota")
+                and not is_in_cooldown(sm)
+                and not sticky_blocked
+                and int(sm.get("consecutive_fails") or 0) < 2
+                and not sticky.expired
+                and bool(sticky.token)
+            )
+            if sticky_ready:
+                first = sticky
+                # Optional backups only from warm live-creds cache. Never
+                # rebuild full pool / full pool-state just for backups.
+                backups: list[GrokCredentials] = []
+                try:
+                    if max_attempts is not None:
+                        limit = max(1, int(max_attempts))
+                    else:
+                        # Compile-time default only — no settings IO on hot path.
+                        limit = max(1, int(MAX_FAILOVER_ATTEMPTS))
+                    if limit > 1:
+                        cached = get_cached_live_credentials(
+                            include_expired=True
+                        ) or []
+                        sticky_id = first.auth_key or ""
+                        sticky_uid = first.user_id or ""
+                        # Prefer warm full pool-state cache when present;
+                        # otherwise treat missing backup meta as enabled.
+                        warm_state = get_cached_account_pool_state() or {}
+                        for c in cached:
+                            if not c or not c.auth_key:
+                                continue
+                            if c.auth_key == sticky_id:
+                                continue
+                            if sticky_uid and (
+                                c.user_id == sticky_uid
+                                or (c.auth_key or "").endswith(
+                                    f"::{sticky_uid}"
+                                )
+                            ):
+                                continue
+                            # Backups must already be fresh — no OIDC here.
+                            if c.expired:
+                                continue
+                            if warm_state:
+                                meta = _pool_meta(
+                                    c.auth_key or "",
+                                    warm_state,
+                                    redis_overlay=False,
+                                )
+                                if not meta.get("enabled", True):
+                                    continue
+                                if is_in_cooldown(meta):
+                                    continue
+                                if model and is_model_blocked(
+                                    c.auth_key or "",
+                                    model,
+                                    warm_state,
+                                    meta=meta,
+                                ):
+                                    continue
+                            backups.append(c)
+                            if len(backups) >= max(0, limit - 1):
+                                break
+                except Exception:
+                    backups = []
+                return [first] + backups
+
+    mode = get_account_mode()
+    # Prefer warm process-local pool-state. Full SELECT of 1k+ rows is the main
+    # cold-path pick cost (~200–350ms) and must not run on every request.
+    state = get_cached_account_pool_state()
+    state_is_partial = False
+    if state is None:
+        state = {}
+        state_is_partial = True
+    # Prefer non-expired first (no network). Include expired-but-refreshable so
+    # the chain can still revive them if every live account is cooling/blocked.
+    all_live = list_live_credentials(include_expired=True, auto_refresh=False)
+
+    def _usable(c: GrokCredentials) -> bool:
+        return (not c.expired) or bool(c.refresh_token)
+
+    # Prefer already-fresh accounts for TTFT; expired ones stay as fallback.
+    # Keep this cheap: avoid multiple full-list passes + repeated meta lookups.
+    fresh: list[GrokCredentials] = []
+    refreshable: list[GrokCredentials] = []
+    for c in all_live:
+        if not c.expired:
+            fresh.append(c)
+        elif c.refresh_token:
+            refreshable.append(c)
+    pool_order = fresh + refreshable
+
+    # Candidate window — we only need a short failover chain, not a ranked full
+    # pool. On cold meta, hydrate just this window via WHERE id = ANY(...).
+    limit_target = (
+        max(1, int(max_attempts))
+        if max_attempts is not None
+        else max(1, int(MAX_FAILOVER_ATTEMPTS))
+    )
+    # Over-fetch a bit so cooldowns/blocks inside the window still leave a chain.
+    window_n = min(len(pool_order), max(24, limit_target * 12))
+    if prefer_account_id and pool_order:
+        # Ensure sticky candidate is considered even if outside the RR window.
+        pref = prefer_account_id
+        head: list[GrokCredentials] = []
+        rest: list[GrokCredentials] = []
+        for c in pool_order:
+            aid = c.auth_key or ""
+            if aid == pref or c.user_id == pref or aid.endswith(f"::{pref}"):
+                head.append(c)
+            else:
+                rest.append(c)
+        pool_order = head + rest
+    # Round-robin / random only need a rotated window, not whole-pool sort.
+    if mode == "random" and len(pool_order) > window_n:
+        sample = list(pool_order)
+        random.shuffle(sample)
+        pool_window = sample[:window_n]
+    elif mode != "least_used" and len(pool_order) > window_n:
+        start = 0
+        try:
+            from store.pool_redis import rr_next
+
+            n = rr_next()
+            if n is not None and pool_order:
+                start = int(n) % len(pool_order)
+            else:
+                raise RuntimeError("redis rr unavailable")
+        except Exception:
+            global _rr_index
+            with _lock:
+                start = _rr_index % max(len(pool_order), 1)
+                _rr_index = (start + 1) % max(len(pool_order), 1)
+        pool_window = pool_order[start:] + pool_order[:start]
+        pool_window = pool_window[:window_n]
+        # Keep sticky (if any) at front of window for affinity reordering later.
+        if prefer_account_id:
+            pref = prefer_account_id
+            sticky_w = [
+                c
+                for c in pool_window
+                if (c.auth_key or "") == pref
+                or c.user_id == pref
+                or (c.auth_key or "").endswith(f"::{pref}")
+            ]
+            if sticky_w:
+                pool_window = sticky_w + [
+                    c for c in pool_window if c not in sticky_w
+                ]
+    else:
+        # least_used benefits from a larger sample but still not the full 1k+.
+        pool_window = pool_order[: min(len(pool_order), max(window_n, 64))]
+
+    if state_is_partial and pool_window:
+        try:
+            ids = [c.auth_key for c in pool_window if c.auth_key]
+            batch = get_account_pool_meta_many(ids)
+            if isinstance(batch, dict) and batch:
+                state.update(batch)
+        except Exception:
+            pass
+
+    # Precompute durable meta once per account for this pick.
+    # No Redis overlay here — that was the multi-second TTFT bottleneck.
+    meta_by_id: dict[str, dict[str, Any]] = {}
+
+    def _meta(c: GrokCredentials) -> dict[str, Any]:
+        aid = c.auth_key or ""
+        m = meta_by_id.get(aid)
+        if m is None:
+            m = _pool_meta(aid, state, redis_overlay=False)
+            meta_by_id[aid] = m
+        return m
+
+    enabled: list[GrokCredentials] = []
+    for c in pool_window:
+        if not _usable(c):
+            continue
+        meta = _meta(c)
+        if not meta.get("enabled", True):
+            continue
+        if model and is_model_blocked(c.auth_key or "", model, state, meta=meta):
+            continue
+        enabled.append(c)
     if not enabled:
-        # any enabled live account
-        enabled = [
-            c
-            for c in all_live
-            if _pool_meta(c.auth_key or "", state)["enabled"]
-        ]
+        # ignore temporary model soft-blocks (free-usage) so light calls still work
+        for c in pool_window:
+            if not _usable(c):
+                continue
+            meta = _meta(c)
+            if not meta.get("enabled", True):
+                continue
+            if model and is_model_blocked(
+                c.auth_key or "", model, state, durable_only=True, meta=meta
+            ):
+                continue
+            enabled.append(c)
     if not enabled:
-        # absolute last resort: all live (except quota-disabled)
-        enabled = [
-            c
-            for c in all_live
-            if not _pool_meta(c.auth_key or "", state).get("disabled_for_quota")
-        ] or list(all_live)
+        # any enabled live account in window
+        for c in pool_window:
+            if _usable(c) and _meta(c).get("enabled", True):
+                enabled.append(c)
+    if not enabled:
+        # absolute last resort: window minus quota-disabled, else whole window
+        for c in pool_window:
+            if _usable(c) and not _meta(c).get("disabled_for_quota"):
+                enabled.append(c)
+        if not enabled:
+            enabled = [c for c in pool_window if _usable(c)]
+    if not enabled and pool_order:
+        # Window was unlucky (all cooling/disabled). One bounded expand only —
+        # still avoid full-table state read by batching the next slice.
+        extra = [c for c in pool_order if c not in pool_window][: max(32, window_n)]
+        if state_is_partial and extra:
+            try:
+                ids = [c.auth_key for c in extra if c.auth_key]
+                batch = get_account_pool_meta_many(ids)
+                if isinstance(batch, dict) and batch:
+                    state.update(batch)
+            except Exception:
+                pass
+        for c in extra:
+            if not _usable(c):
+                continue
+            meta = _meta(c)
+            if not meta.get("enabled", True):
+                continue
+            if model and is_model_blocked(c.auth_key or "", model, state, meta=meta):
+                continue
+            enabled.append(c)
+            if len(enabled) >= max(8, limit_target * 2):
+                break
 
     # De-dupe by user_id (legacy dual keys)
     seen_users: set[str] = set()
@@ -1632,7 +1967,7 @@ def try_acquire_sequence(
     enabled = deduped
 
     def cool_key(c: GrokCredentials) -> tuple[int, float, int, float]:
-        meta = _pool_meta(c.auth_key or "", state)
+        meta = _meta(c)
         cooling = 1 if is_in_cooldown(meta) else 0
         # sooner-ready cooling accounts rank ahead of long-cooling ones
         until = 0.0
@@ -1641,8 +1976,8 @@ def try_acquire_sequence(
                 until = float(meta.get("cooldown_until") or 0)
             except Exception:
                 until = 0.0
-        used = meta["request_count"]
-        last = float(meta["last_used_at"] or 0)
+        used = int(meta.get("request_count") or 0)
+        last = float(meta.get("last_used_at") or 0)
         health = _health_penalty(meta)
         if mode == "least_used":
             return (cooling, health, used, last)
@@ -1653,52 +1988,25 @@ def try_acquire_sequence(
         random.shuffle(ordered)
         ordered.sort(
             key=lambda c: (
-                1 if is_in_cooldown(_pool_meta(c.auth_key or "", state)) else 0,
-                _health_penalty(_pool_meta(c.auth_key or "", state)),
+                1 if is_in_cooldown(_meta(c)) else 0,
+                _health_penalty(_meta(c)),
             )
         )
     elif mode == "least_used":
         ordered = sorted(enabled, key=cool_key)
-    else:  # round_robin — start from current RR head
+    else:  # round_robin — window already rotated; just prefer ready accounts
         if not enabled:
             return []
-        start = 0
-        try:
-            from store.pool_redis import rr_next
-
-            n = rr_next()
-            if n is not None:
-                start = int(n) % len(enabled)
-            else:
-                raise RuntimeError("redis rr unavailable")
-        except Exception:
-            global _rr_index
-            with _lock:
-                start = _rr_index % len(enabled)
-                _rr_index = (start + 1) % max(len(enabled), 1)
-        rotated = enabled[start:] + enabled[:start]
-        # non-cooling first (preserve RR order), then cooling by soonest ready
-        not_cooling = [
-            c
-            for c in rotated
-            if not is_in_cooldown(_pool_meta(c.auth_key or "", state))
-        ]
-        cooling = [
-            c
-            for c in rotated
-            if is_in_cooldown(_pool_meta(c.auth_key or "", state))
-        ]
-        cooling.sort(
-            key=lambda c: float(
-                _pool_meta(c.auth_key or "", state).get("cooldown_until") or 0
-            )
-        )
-        # Within ready group, lightly prefer healthier accounts without destroying RR.
+        # O(1) position map — preserve RR order from the window construction.
+        pos = {id(c): i for i, c in enumerate(enabled)}
+        not_cooling = [c for c in enabled if not is_in_cooldown(_meta(c))]
+        cooling = [c for c in enabled if is_in_cooldown(_meta(c))]
+        cooling.sort(key=lambda c: float(_meta(c).get("cooldown_until") or 0))
         not_cooling_sorted = sorted(
             not_cooling,
             key=lambda c: (
-                int(_health_penalty(_pool_meta(c.auth_key or "", state)) // 3),
-                rotated.index(c),
+                int(_health_penalty(_meta(c)) // 3),
+                pos.get(id(c), 0),
             ),
         )
         ordered = not_cooling_sorted + cooling
@@ -1715,29 +2023,54 @@ def try_acquire_sequence(
             else:
                 rest.append(c)
         if sticky:
-            sm = _pool_meta(sticky[0].auth_key or "", state)
-            # If sticky account is cooling or unhealthy streak is high, don't force it first —
-            # keep it in chain for possible later try, but prefer a ready peer now.
-            if is_in_cooldown(sm) or int(sm.get("consecutive_fails") or 0) >= 3:
+            sm = _meta(sticky[0])
+            sticky_blocked = bool(
+                model
+                and is_model_blocked(
+                    sticky[0].auth_key or "", model, state, meta=sm
+                )
+            )
+            # Prefer ready peers first when sticky is cooling / model-blocked /
+            # already failing. Keep sticky in chain for later try (affinity).
+            if (
+                is_in_cooldown(sm)
+                or sticky_blocked
+                or int(sm.get("consecutive_fails") or 0) >= 2
+                or sticky[0].expired
+            ):
                 ordered = rest + sticky
             else:
                 ordered = sticky + rest
 
     limit = max_attempts if max_attempts is not None else max_failover_attempts()
-    # When many accounts are soft-blocked, allow a slightly longer chain so a
-    # single free-usage wave does not exhaust the short failover list.
+    # Soft-block waves: allow a modest longer chain, but keep it TTFT-friendly.
     if max_attempts is None:
         ready = sum(
             1
             for c in ordered
-            if not is_in_cooldown(_pool_meta(c.auth_key or "", state))
-            and not (model and is_model_blocked(c.auth_key or "", model, state))
+            if not is_in_cooldown(_meta(c))
+            and not (
+                model
+                and is_model_blocked(
+                    c.auth_key or "", model, state, meta=_meta(c)
+                )
+            )
         )
         if ready < 2:
-            limit = max(int(limit or 1), min(16, max(8, len(ordered) // 20 or 8)))
+            limit = max(int(limit or 1), min(8, max(4, len(ordered) // 8 or 4)))
     if limit is not None:
         ordered = ordered[: max(1, int(limit))]
-    return ordered
+    # Only refresh the first candidate if it is already expired. Refreshing the
+    # whole chain here serializes OIDC RTs before any upstream byte is sent.
+    if ordered:
+        first = _ensure_fresh_creds(ordered[0], auto_refresh=True)
+        if first.expired and not first.refresh_token:
+            # First account unusable and no refresh path — drop it and try next
+            # without paying OIDC for the rest of the chain yet.
+            rest = list(ordered[1:])
+            return [c for c in rest if (not c.expired) or c.refresh_token]
+        ordered = [first] + list(ordered[1:])
+    return [c for c in ordered if (not c.expired) or c.refresh_token]
 
 
 def clear_account_cooldown(account_id: str) -> dict[str, Any] | None:

@@ -1,8 +1,13 @@
-"""MoeMail helpers + proxy normalization for protocol registration.
+"""Mail helpers (MoeMail / YYDS / GPTMail) + proxy normalization for protocol registration.
 
 Kept intentionally small: only the pieces used by ``grok_build_adapter``
 (and optional admin proxy smoke tests). The legacy full-session
 ``email_registration`` flow was removed in favor of grok-build-auth.
+
+Providers:
+  - moemail  — beilunyang/moemail style API (``/api/emails/...``)
+  - yyds     — vip.215.im / maliapi.215.im YYDS Mail (``/v1/accounts`` …)
+  - gptmail  — mail.chatgpt.org.uk GPTMail (``/api/generate-email`` …)
 """
 from __future__ import annotations
 
@@ -22,12 +27,84 @@ from config import (
     XAI_PROXY_USERNAME,
 )
 
+# Official YYDS Mail API host (docs: https://vip.215.im/docs).
+YYDS_DEFAULT_BASE_URL = "https://maliapi.215.im"
+YYDS_DEFAULT_DOMAIN = ""  # must be chosen from GET /v1/domains or admin config
+
+# Official GPTMail host (docs: https://mail.chatgpt.org.uk/zh/api/).
+GPTMAIL_DEFAULT_BASE_URL = "https://mail.chatgpt.org.uk"
+# Docs mention public test key ``gpt-test`` (daily quota; may be exhausted).
+GPTMAIL_PUBLIC_TEST_KEY = "gpt-test"
+
 
 def _headers(api_key: str | None = None) -> dict[str, str]:
     key = api_key or MOEMAIL_API_KEY
     if not key:
         return {}
     return {"X-API-Key": key}
+
+
+def normalize_mail_provider(provider: str | None, *, base_url: str | None = None) -> str:
+    """Return ``moemail`` | ``yyds`` | ``gptmail``. Infer from base_url when empty."""
+    p = (provider or "").strip().lower()
+    if p in {"yyds", "yydsmail", "yyds_mail", "vip215", "215", "maliapi"}:
+        return "yyds"
+    if p in {
+        "gptmail",
+        "gpt-mail",
+        "gpt_mail",
+        "chatgptmail",
+        "chatgpt-mail",
+        "mail.chatgpt",
+        "chatgpt.org.uk",
+    }:
+        return "gptmail"
+    if p in {"moemail", "moe", "moe-mail"}:
+        return "moemail"
+    base = (base_url or "").strip().lower()
+    if any(x in base for x in ("maliapi.215.im", "vip.215.im", "215.im/v1", "yyds")):
+        return "yyds"
+    if any(
+        x in base
+        for x in (
+            "mail.chatgpt.org.uk",
+            "chatgpt.org.uk",
+            "gptmail",
+        )
+    ):
+        return "gptmail"
+    return "moemail"
+
+
+def normalize_yyds_base_url(base_url: str | None = None) -> str:
+    """Normalize user input (docs URL / trailing /v1) to API origin."""
+    raw = (base_url or "").strip()
+    if not raw:
+        return YYDS_DEFAULT_BASE_URL
+    # Common mistakes: paste docs portal or bare path.
+    lower = raw.lower()
+    if "vip.215.im" in lower and "maliapi" not in lower:
+        return YYDS_DEFAULT_BASE_URL
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+    if not parsed.netloc:
+        return YYDS_DEFAULT_BASE_URL
+    # Strip accidental /v1 /docs suffixes from path-only pastes handled above.
+    return origin or YYDS_DEFAULT_BASE_URL
+
+
+def normalize_gptmail_base_url(base_url: str | None = None) -> str:
+    """Normalize docs / language path pastes to GPTMail origin."""
+    raw = (base_url or "").strip()
+    if not raw:
+        return GPTMAIL_DEFAULT_BASE_URL
+    lower = raw.lower()
+    if "chatgpt.org.uk" in lower or "gptmail" in lower:
+        # Always pin to official origin (docs may be /zh/api, /api, etc.).
+        return GPTMAIL_DEFAULT_BASE_URL
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+    return origin or GPTMAIL_DEFAULT_BASE_URL
 
 
 def normalize_proxy_config(
@@ -258,6 +335,565 @@ def moemail_fetch_messages(
 # Private aliases matching historical names used by grok_build_adapter.
 _moemail_create_mailbox = moemail_create_mailbox
 _moemail_fetch_messages = moemail_fetch_messages
+
+
+def yyds_create_mailbox(
+    *,
+    name: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,  # accepted for API compat; YYDS temp mail is ~24h
+    api_key: str | None = None,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> dict[str, Any]:
+    """Create a temporary inbox on YYDS Mail (https://vip.215.im/docs)."""
+    key = (api_key or MOEMAIL_API_KEY or "").strip()
+    if not key:
+        raise ValueError(
+            "YYDS Mail API key missing. Set GROK2API_MOEMAIL_API_KEY / api_key "
+            "(X-API-Key, usually starts with AC-)."
+        )
+    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
+    if not dom:
+        # Best-effort: pick first public domain from catalog.
+        dom = yyds_pick_domain(api_key=key, base_url=base) or ""
+    if not dom:
+        raise ValueError(
+            "YYDS Mail domain missing. Set domain in registration config "
+            "(e.g. a public domain from GET /v1/domains)."
+        )
+    local = (name or "").strip().lower() or None
+    payload: dict[str, Any] = {"domain": dom}
+    if local:
+        payload["localPart"] = local
+
+    with httpx.Client(timeout=30.0) as client:
+        headers = {**_headers(key), "Content-Type": "application/json"}
+        resp = client.post(f"{base}/v1/accounts", json=payload, headers=headers)
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"YYDS create failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json()
+
+    # Envelope: { success, data: { id, address, token, ... } }
+    body = data.get("data") if isinstance(data, dict) and "data" in data else data
+    if not isinstance(body, dict):
+        raise RuntimeError(f"Unexpected YYDS create response: {data}")
+    email_id = body.get("id") or body.get("inboxId") or body.get("accountId")
+    address = body.get("address") or body.get("email")
+    token = body.get("token") or body.get("tempToken") or ""
+    if not email_id or not address:
+        raise RuntimeError(f"Unexpected YYDS create response: {data}")
+    return {
+        "id": str(email_id),
+        "email": str(address),
+        "token": str(token or ""),
+        "provider": "yyds",
+        "raw": data,
+        # Keep expiry_ms for logging only (service is ~24h temp).
+        "expiry_ms": 86_400_000 if expiry_ms is None else int(expiry_ms),
+    }
+
+
+def yyds_pick_domain(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> str | None:
+    """Pick a healthy public domain from YYDS catalog (prefer wildcard MX)."""
+    key = (api_key or MOEMAIL_API_KEY or "").strip()
+    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.get(f"{base}/v1/domains", headers=_headers(key) if key else {})
+            if resp.status_code >= 400:
+                return None
+            data = resp.json()
+    except Exception:
+        return None
+    items = data
+    if isinstance(data, dict):
+        items = data.get("data") or data.get("domains") or data.get("items") or []
+    if not isinstance(items, list):
+        return None
+    preferred: list[str] = []
+    fallback: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("domain") or item.get("name") or item.get("host")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip().lstrip("@").strip(".")
+        if item.get("isPublic") is False:
+            continue
+        if item.get("receivingReady") is False or item.get("isMxValid") is False:
+            continue
+        if item.get("wildcardMxValid") is True or item.get("wildcard_mx_valid") is True:
+            preferred.append(name)
+        else:
+            fallback.append(name)
+    return (preferred or fallback or [None])[0]
+
+
+def yyds_fetch_messages(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """List (+ optionally detail) messages for a YYDS inbox."""
+    if not email_id and not address:
+        return []
+    key = (api_key or MOEMAIL_API_KEY or "").strip()
+    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    headers = _headers(key) if key else {}
+    if token and not key:
+        headers = {"Authorization": f"Bearer {token}"}
+    elif token and key:
+        # Prefer API key; keep bearer as extra only when key missing.
+        pass
+
+    with httpx.Client(timeout=30.0) as client:
+        # Prefer canonical inbox path when id is known; fall back to address query.
+        messages: list[Any] = []
+        if email_id:
+            resp = client.get(
+                f"{base}/v1/inboxes/{email_id}/messages",
+                headers=headers,
+                params={"limit": 20},
+            )
+            if resp.status_code >= 400 and address:
+                resp = client.get(
+                    f"{base}/v1/messages",
+                    headers=headers,
+                    params={"address": address, "limit": 20},
+                )
+            elif resp.status_code >= 400:
+                raise RuntimeError(
+                    f"YYDS list failed {resp.status_code}: {resp.text[:500]}"
+                )
+        else:
+            resp = client.get(
+                f"{base}/v1/messages",
+                headers=headers,
+                params={"address": address, "limit": 20},
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"YYDS list failed {resp.status_code}: {resp.text[:500]}"
+                )
+
+        data = resp.json() if resp.content else {}
+        body = data.get("data") if isinstance(data, dict) and "data" in data else data
+        if isinstance(body, dict):
+            messages = body.get("messages") or body.get("items") or []
+        elif isinstance(body, list):
+            messages = body
+        if not isinstance(messages, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for raw in messages[:20]:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            msg_id = item.get("id") or item.get("messageId")
+            if include_details and msg_id:
+                params = {"address": address} if address else None
+                detail = client.get(
+                    f"{base}/v1/messages/{msg_id}",
+                    headers=headers,
+                    params=params,
+                )
+                if detail.status_code == 200:
+                    d = detail.json()
+                    msg = d.get("data") if isinstance(d, dict) and "data" in d else d
+                    if isinstance(msg, dict):
+                        # Some envelopes nest { message: {...} }
+                        if isinstance(msg.get("message"), dict):
+                            item.update(msg["message"])
+                        else:
+                            item.update(msg)
+            # Flatten from.address for code extractors used by the adapter.
+            from_obj = item.get("from")
+            if isinstance(from_obj, dict):
+                item.setdefault("from_address", from_obj.get("address") or "")
+                item.setdefault("from", from_obj.get("address") or from_obj.get("name") or "")
+            text = "\n".join(
+                str(item.get(k) or "")
+                for k in (
+                    "subject",
+                    "content",
+                    "text",
+                    "textBody",
+                    "html",
+                    "htmlBody",
+                    "body",
+                    "from_address",
+                    "from",
+                    "verificationCode",
+                )
+            )
+            item["extracted"] = _extract_codes_and_links(text)
+            # Surface server-side OTP when present.
+            vc = item.get("verificationCode")
+            if vc and isinstance(item.get("extracted"), dict):
+                codes = list(item["extracted"].get("codes") or [])
+                s = str(vc).strip()
+                if s and s not in codes:
+                    codes.insert(0, s)
+                    item["extracted"]["codes"] = codes
+            out.append(item)
+        return out
+
+
+def gptmail_create_mailbox(
+    *,
+    name: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,  # accepted for API compat; GPTMail retains ~24h
+    api_key: str | None = None,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> dict[str, Any]:
+    """Create a temporary inbox on GPTMail (https://mail.chatgpt.org.uk/zh/api/)."""
+    key = (api_key or MOEMAIL_API_KEY or "").strip() or GPTMAIL_PUBLIC_TEST_KEY
+    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
+    dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
+    pre = (name or "").strip().lower() or None
+
+    # Prefer server-side generate so we get a real active domain when none given.
+    # Docs: GET /api/generate-email random; POST with {prefix, domain}.
+    with httpx.Client(timeout=30.0) as client:
+        headers = {**_headers(key), "Content-Type": "application/json"}
+        if pre or dom:
+            payload: dict[str, Any] = {}
+            if pre:
+                payload["prefix"] = pre
+            if dom:
+                payload["domain"] = dom
+            resp = client.post(
+                f"{base}/api/generate-email",
+                json=payload,
+                headers=headers,
+            )
+        else:
+            resp = client.get(f"{base}/api/generate-email", headers=headers)
+
+        if resp.status_code >= 400:
+            # Auth / quota failures must surface — composed addresses still need
+            # a valid key to poll /api/emails.
+            err_l = (resp.text or "").lower()
+            if resp.status_code in (401, 403) or (
+                "api key" in err_l
+                or "api_key" in err_l
+                or "无效" in (resp.text or "")
+                and "key" in err_l
+            ):
+                raise RuntimeError(
+                    f"GPTMail create failed {resp.status_code}: {resp.text[:500]}"
+                )
+            # Retry without domain, then compose prefix@public-domain.
+            # Docs allow skipping generate when a public domain is known.
+            if pre and dom:
+                resp2 = client.post(
+                    f"{base}/api/generate-email",
+                    json={"prefix": pre},
+                    headers=headers,
+                )
+                if resp2.status_code < 400:
+                    resp = resp2
+                elif resp2.status_code in (401, 403):
+                    raise RuntimeError(
+                        f"GPTMail create failed {resp2.status_code}: {resp2.text[:500]}"
+                    )
+                else:
+                    picked = gptmail_pick_domain(api_key=key, base_url=base) or dom
+                    if pre and picked:
+                        address = f"{pre}@{picked}"
+                        return {
+                            "id": address,
+                            "email": address,
+                            "token": "",
+                            "provider": "gptmail",
+                            "raw": {
+                                "composed": True,
+                                "error": resp.text[:300],
+                                "domain": picked,
+                            },
+                            "expiry_ms": 86_400_000
+                            if expiry_ms is None
+                            else int(expiry_ms),
+                        }
+            elif pre and resp.status_code not in (401, 403):
+                picked = dom or gptmail_pick_domain(api_key=key, base_url=base)
+                if picked:
+                    address = f"{pre}@{picked}"
+                    return {
+                        "id": address,
+                        "email": address,
+                        "token": "",
+                        "provider": "gptmail",
+                        "raw": {
+                            "composed": True,
+                            "error": resp.text[:300],
+                            "domain": picked,
+                        },
+                        "expiry_ms": 86_400_000
+                        if expiry_ms is None
+                        else int(expiry_ms),
+                    }
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"GPTMail create failed {resp.status_code}: {resp.text[:500]}"
+                )
+
+        data = resp.json() if resp.content else {}
+
+    body = data.get("data") if isinstance(data, dict) and "data" in data else data
+    if not isinstance(body, dict):
+        raise RuntimeError(f"Unexpected GPTMail create response: {data}")
+    address = body.get("email") or body.get("address")
+    if not address or "@" not in str(address):
+        raise RuntimeError(f"Unexpected GPTMail create response: {data}")
+    address = str(address).strip()
+    # GPTMail uses the email address itself as the mailbox key for list/clear.
+    return {
+        "id": address,
+        "email": address,
+        "token": "",
+        "provider": "gptmail",
+        "raw": data,
+        "expiry_ms": 86_400_000 if expiry_ms is None else int(expiry_ms),
+    }
+
+
+def gptmail_pick_domain(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> str | None:
+    """Pick an active public domain from GPTMail catalog."""
+    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
+    key = (api_key or MOEMAIL_API_KEY or "").strip()
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            # Public domain list does not require a key.
+            resp = client.get(
+                f"{base}/api/domains/public",
+                headers=_headers(key) if key else {},
+            )
+            if resp.status_code >= 400:
+                return None
+            data = resp.json()
+    except Exception:
+        return None
+    body = data.get("data") if isinstance(data, dict) and "data" in data else data
+    items = body.get("domains") if isinstance(body, dict) else body
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("domain_name") or item.get("domain") or item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if item.get("is_active") in (0, False, "0", "false"):
+            continue
+        return name.strip().lstrip("@").strip(".")
+    return None
+
+
+def gptmail_fetch_messages(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """List messages for a GPTMail inbox.
+
+    GPTMail keys mailboxes by the full email address (``?email=``).
+    ``email_id`` may be either the address or a message id when fetching detail.
+    """
+    addr = (address or email_id or "").strip()
+    if not addr or "@" not in addr:
+        # If only a message id was passed, we cannot list; need address.
+        if address and "@" in address:
+            addr = address.strip()
+        else:
+            return []
+    key = (api_key or MOEMAIL_API_KEY or "").strip() or GPTMAIL_PUBLIC_TEST_KEY
+    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
+    headers = _headers(key)
+
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.get(
+            f"{base}/api/emails",
+            headers=headers,
+            params={"email": addr},
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"GPTMail list failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+        body = data.get("data") if isinstance(data, dict) and "data" in data else data
+        messages: list[Any] = []
+        if isinstance(body, dict):
+            messages = body.get("emails") or body.get("messages") or body.get("items") or []
+        elif isinstance(body, list):
+            messages = body
+        if not isinstance(messages, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for raw in messages[:20]:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            msg_id = item.get("id") or item.get("messageId") or item.get("email_id")
+            # List payload often already includes content; detail is optional.
+            if include_details and msg_id and not (
+                item.get("content") or item.get("html_content") or item.get("html")
+            ):
+                detail = client.get(
+                    f"{base}/api/email/{msg_id}",
+                    headers=headers,
+                )
+                if detail.status_code == 200:
+                    d = detail.json() if detail.content else {}
+                    msg = d.get("data") if isinstance(d, dict) and "data" in d else d
+                    if isinstance(msg, dict):
+                        if isinstance(msg.get("email"), dict):
+                            item.update(msg["email"])
+                        elif isinstance(msg.get("message"), dict):
+                            item.update(msg["message"])
+                        else:
+                            item.update(msg)
+            # Normalize field names for shared code extractors.
+            if item.get("html_content") and not item.get("html"):
+                item["html"] = item.get("html_content")
+            if item.get("content") and not item.get("text"):
+                item["text"] = item.get("content")
+            if item.get("from_address") and not item.get("from"):
+                item["from"] = item.get("from_address")
+            text = "\n".join(
+                str(item.get(k) or "")
+                for k in (
+                    "subject",
+                    "content",
+                    "text",
+                    "html",
+                    "html_content",
+                    "from_address",
+                    "from",
+                )
+            )
+            item["extracted"] = _extract_codes_and_links(text)
+            out.append(item)
+        return out
+
+
+def create_mailbox(
+    *,
+    provider: str | None = None,
+    name: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> dict[str, Any]:
+    """Provider-aware mailbox create (``moemail`` | ``yyds`` | ``gptmail``)."""
+    prov = normalize_mail_provider(provider, base_url=base_url)
+    if prov == "yyds":
+        return yyds_create_mailbox(
+            name=name,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+    if prov == "gptmail":
+        return gptmail_create_mailbox(
+            name=name,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+    box = moemail_create_mailbox(
+        name=name,
+        domain=domain,
+        expiry_ms=expiry_ms,
+        api_key=api_key,
+        base_url=base_url,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
+    )
+    box.setdefault("provider", "moemail")
+    box.setdefault("token", "")
+    return box
+
+
+def fetch_messages(
+    email_id: str,
+    *,
+    provider: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """Provider-aware message list."""
+    prov = normalize_mail_provider(provider, base_url=base_url)
+    if prov == "yyds":
+        return yyds_fetch_messages(
+            email_id,
+            api_key=api_key,
+            base_url=base_url,
+            include_details=include_details,
+            address=address,
+            token=token,
+        )
+    if prov == "gptmail":
+        return gptmail_fetch_messages(
+            email_id,
+            api_key=api_key,
+            base_url=base_url,
+            include_details=include_details,
+            address=address or email_id,
+            token=token,
+        )
+    return moemail_fetch_messages(
+        email_id,
+        api_key=api_key,
+        base_url=base_url,
+        include_details=include_details,
+    )
 
 
 def test_xai_proxy(

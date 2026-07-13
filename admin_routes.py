@@ -181,15 +181,35 @@ class ImportSsoBody(BaseModel):
 class EmailRegistrationBody(BaseModel):
     """Start email-assisted accounts.x.ai registration."""
 
-    provider: str = Field(default="moemail", pattern="^moemail$")
+    # Backward-compat: older clients sent provider=moemail for the mail service.
+    provider: str | None = Field(
+        default=None,
+        pattern="^(moemail|yyds|gptmail)$",
+        description="Deprecated alias of mail_provider",
+    )
+    mail_provider: str | None = Field(
+        default=None,
+        pattern="^(moemail|yyds|gptmail)$",
+        description="Temp-mail: moemail | yyds (vip.215.im) | gptmail (mail.chatgpt.org.uk)",
+    )
     protocol: str = Field(default="grpc", pattern="^grpc$")
     email: str | None = Field(default=None, max_length=256)
     mailbox_id: str | None = Field(default=None, max_length=256)
     prefix: str | None = Field(default=None, max_length=64)
     domain: str | None = Field(default=None, max_length=128)
-    # MoeMail official presets only: 1h / 24h / 3d / permanent(0)
+    # MoeMail official presets: 1h / 24h / 3d / permanent(0). YYDS is ~24h temp.
     expiry_ms: int | None = Field(default=None, ge=0, le=259200000)
-    api_key: str | None = Field(default=None, max_length=512)
+    api_key: str | None = Field(
+        default=None,
+        max_length=512,
+        description="Active mail API key (mirrored into per-provider slot)",
+    )
+    moemail_api_key: str | None = Field(default=None, max_length=512)
+    yyds_api_key: str | None = Field(default=None, max_length=512)
+    gptmail_api_key: str | None = Field(default=None, max_length=512)
+    moemail_domain: str | None = Field(default=None, max_length=128)
+    yyds_domain: str | None = Field(default=None, max_length=128)
+    gptmail_domain: str | None = Field(default=None, max_length=128)
     captcha_provider: str | None = Field(
         default=None,
         pattern="^(local|yescaptcha)$",
@@ -201,7 +221,11 @@ class EmailRegistrationBody(BaseModel):
         description="Local Turnstile Solver base URL, e.g. http://127.0.0.1:5072",
     )
     yescaptcha_key: str | None = Field(default=None, max_length=512)
-    base_url: str | None = Field(default=None, max_length=256)
+    base_url: str | None = Field(
+        default=None,
+        max_length=256,
+        description="MoeMail only; YYDS/GPTMail use fixed hosts",
+    )
     proxy: str | None = Field(default=None, max_length=512)
     proxy_username: str | None = Field(default=None, max_length=256)
     proxy_password: str | None = Field(default=None, max_length=512)
@@ -232,11 +256,34 @@ class EmailRegistrationProxyTestBody(BaseModel):
 
 
 class RegistrationConfigBody(BaseModel):
-    """Persist protocol-registration form (MoeMail / captcha / proxy)."""
+    """Persist protocol-registration form (mail provider / captcha / proxy)."""
 
-    base_url: str | None = Field(default=None, max_length=256)
-    api_key: str | None = Field(default=None, max_length=512)
-    domain: str | None = Field(default=None, max_length=128)
+    mail_provider: str | None = Field(
+        default=None,
+        pattern="^(moemail|yyds|gptmail)$",
+        description="Temp-mail: moemail | yyds (vip.215.im) | gptmail (mail.chatgpt.org.uk)",
+    )
+    base_url: str | None = Field(
+        default=None,
+        max_length=256,
+        description="MoeMail only; YYDS/GPTMail ignore this (fixed hosts)",
+    )
+    api_key: str | None = Field(
+        default=None,
+        max_length=512,
+        description="Active key for selected provider (also stored in per-provider field)",
+    )
+    moemail_api_key: str | None = Field(default=None, max_length=512)
+    yyds_api_key: str | None = Field(default=None, max_length=512)
+    gptmail_api_key: str | None = Field(default=None, max_length=512)
+    domain: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Active domain for selected mail provider",
+    )
+    moemail_domain: str | None = Field(default=None, max_length=128)
+    yyds_domain: str | None = Field(default=None, max_length=128)
+    gptmail_domain: str | None = Field(default=None, max_length=128)
     prefix: str | None = Field(default=None, max_length=64)
     expiry_ms: int | None = Field(default=None, ge=0, le=259200000)
     captcha_provider: str | None = Field(
@@ -1310,10 +1357,21 @@ def _require_register_adapter():
 
 
 def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfigBody) -> dict:
+    mail_provider = getattr(body, "mail_provider", None)
+    if not mail_provider:
+        # Legacy field on EmailRegistrationBody.
+        mail_provider = getattr(body, "provider", None)
     return {
+        "mail_provider": mail_provider,
         "base_url": body.base_url,
         "api_key": getattr(body, "api_key", None),
+        "moemail_api_key": getattr(body, "moemail_api_key", None),
+        "yyds_api_key": getattr(body, "yyds_api_key", None),
+        "gptmail_api_key": getattr(body, "gptmail_api_key", None),
         "domain": getattr(body, "domain", None),
+        "moemail_domain": getattr(body, "moemail_domain", None),
+        "yyds_domain": getattr(body, "yyds_domain", None),
+        "gptmail_domain": getattr(body, "gptmail_domain", None),
         "prefix": getattr(body, "prefix", None),
         "expiry_ms": getattr(body, "expiry_ms", None),
         "captcha_provider": getattr(body, "captcha_provider", None),
@@ -1385,7 +1443,7 @@ async def start_email_registration(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Start protocol registration (grok-build-auth) + MoeMail + SSO import.
+    """Start protocol registration (grok-build-auth) + mail provider + SSO import.
 
     Supports multi-thread batch via count/concurrency/stagger_ms.
     Non-empty form fields override the saved DB/env config; empty fields fall
@@ -1411,6 +1469,7 @@ async def start_email_registration(
             prefix=resolved.get("prefix") or None,
             domain=resolved.get("domain") or None,
             expiry_ms=resolved.get("expiry_ms"),
+            mail_provider=resolved.get("mail_provider") or None,
             captcha_provider=resolved.get("captcha_provider") or None,
             local_solver_url=resolved.get("local_solver_url") or None,
             yescaptcha_key=resolved.get("yescaptcha_key") or None,
@@ -1419,7 +1478,7 @@ async def start_email_registration(
             stagger_ms=resolved.get("stagger_ms"),
         )
     except TypeError:
-        # Older adapter without batch kwargs.
+        # Older adapter without batch / mail_provider kwargs.
         try:
             result = adapter.start_registration(
                 proxy=resolved.get("proxy") or None,
@@ -1803,6 +1862,11 @@ async def delete_account(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
+    # Guard against path-greedy matches swallowing register-email subpaths
+    # (e.g. /accounts/register-email/batches/.../stop) if route order shifts.
+    aid = str(account_id or "")
+    if aid.startswith("register-email") or "/register-email" in aid:
+        raise HTTPException(status_code=404, detail="Not found")
     require_admin(request, x_admin_token)
     if not accounts.remove_account(account_id):
         raise HTTPException(status_code=404, detail="Account not found")

@@ -212,9 +212,35 @@ def _row_to_meta(r) -> dict[str, Any]:
     return meta
 
 
+_pool_state_cache: dict[str, Any] | None = None
+_pool_state_cache_at = 0.0
+_POOL_STATE_CACHE_TTL = 1.5
+
+
+def invalidate_pool_state_cache() -> None:
+    global _pool_state_cache, _pool_state_cache_at
+    _pool_state_cache = None
+    _pool_state_cache_at = 0.0
+
+
+def get_cached_account_pool_state() -> dict[str, Any] | None:
+    """Return warm process-local pool-state cache only (no DB)."""
+    now = time.time()
+    if (
+        _pool_state_cache is not None
+        and now - _pool_state_cache_at < _POOL_STATE_CACHE_TTL
+    ):
+        return dict(_pool_state_cache)
+    return None
+
+
 def get_account_pool_state() -> dict[str, Any]:
     if not enabled():
         return {}
+    global _pool_state_cache, _pool_state_cache_at
+    cached = get_cached_account_pool_state()
+    if cached is not None:
+        return cached
     out: dict[str, Any] = {}
     with connection() as conn:
         with conn.cursor() as cur:
@@ -226,7 +252,9 @@ def get_account_pool_state() -> dict[str, Any]:
             )
             for r in cur.fetchall():
                 out[str(r[0])] = _row_to_meta(r)
-    return out
+    _pool_state_cache = out
+    _pool_state_cache_at = time.time()
+    return dict(out)
 
 
 def get_pool_meta_many(account_ids: list[str]) -> dict[str, Any]:
@@ -236,6 +264,20 @@ def get_pool_meta_many(account_ids: list[str]) -> dict[str, Any]:
     ids = [str(x) for x in account_ids if str(x).strip()]
     if not ids:
         return {}
+    # Prefer warm full-state cache for single/few lookups (sticky TTFT path).
+    now = time.time()
+    if (
+        _pool_state_cache is not None
+        and now - _pool_state_cache_at < _POOL_STATE_CACHE_TTL
+        and len(ids) <= 8
+    ):
+        out_cached: dict[str, Any] = {}
+        for aid in ids:
+            m = _pool_state_cache.get(aid)
+            if isinstance(m, dict):
+                out_cached[aid] = dict(m)
+        if len(out_cached) == len(ids):
+            return out_cached
     out: dict[str, Any] = {}
     with connection() as conn:
         with conn.cursor() as cur:
@@ -250,6 +292,37 @@ def get_pool_meta_many(account_ids: list[str]) -> dict[str, Any]:
             for r in cur.fetchall():
                 out[str(r[0])] = _row_to_meta(r)
     return out
+
+
+def get_pool_meta(account_id: str) -> dict[str, Any]:
+    """Single-account durable pool meta (O(1) for sticky TTFT)."""
+    if not enabled() or not account_id:
+        return {}
+    aid = str(account_id).strip()
+    if not aid:
+        return {}
+    now = time.time()
+    if (
+        _pool_state_cache is not None
+        and now - _pool_state_cache_at < _POOL_STATE_CACHE_TTL
+    ):
+        m = _pool_state_cache.get(aid)
+        return dict(m) if isinstance(m, dict) else {}
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {_POOL_SELECT_COLS}
+                FROM account_pool
+                WHERE account_id = %s
+                LIMIT 1
+                """,
+                (aid,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return {}
+    return _row_to_meta(row)
 
 
 def pool_counts(*, maintain: bool = False) -> dict[str, int]:
@@ -404,6 +477,7 @@ def save_account_pool_state(state: dict[str, Any]) -> None:
             for aid in existing - incoming:
                 cur.execute("DELETE FROM account_pool WHERE account_id = %s", (aid,))
         conn.commit()
+    invalidate_pool_state_cache()
 
 
 def upsert_pool_meta(account_id: str, meta: dict[str, Any]) -> None:
@@ -413,6 +487,7 @@ def upsert_pool_meta(account_id: str, meta: dict[str, Any]) -> None:
         with conn.cursor() as cur:
             _upsert_pool(cur, account_id, meta, preserve_active_cooldown=True)
         conn.commit()
+    invalidate_pool_state_cache()
 
 
 def patch_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -455,6 +530,7 @@ def patch_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str, Any]:
             meta["pool_status"] = _derive_pool_status(meta)
             _upsert_pool(cur, account_id, meta, preserve_active_cooldown=False)
         conn.commit()
+    invalidate_pool_state_cache()
     return meta
 
 

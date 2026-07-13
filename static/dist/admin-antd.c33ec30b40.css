@@ -256,6 +256,35 @@ textarea { min-height: 90px; resize: vertical; font-family: var(--mono); font-si
 .g2a-pager { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
 .g2a-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0 4px; }
 .g2a-toolbar input { max-width: 280px; }
+/* Compact sort control pinned to the right of account toolbar. */
+.g2a-sort-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.g2a-sort-label {
+  font-size: 12px;
+  color: var(--ant-color-text-secondary);
+  line-height: 1;
+}
+.g2a-sort-select,
+#acc-sort.g2a-sort-select {
+  min-width: 0 !important;
+  width: auto;
+  max-width: 7.5rem;
+  height: 28px;
+  padding: 0 22px 0 8px;
+  font-size: 12px;
+  line-height: 26px;
+  border-radius: 6px;
+}
+@media (max-width: 900px) {
+  .g2a-sort-wrap { margin-left: 0; }
+  .g2a-sort-select, #acc-sort.g2a-sort-select { max-width: 6.8rem; }
+}
 
 /* tags / pills */
 .g2a-tag, .pill, .badge {

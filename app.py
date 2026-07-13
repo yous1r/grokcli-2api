@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.25"
+APP_VERSION = "1.9.38"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -75,12 +75,15 @@ async def get_http_client() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         max_conn = int(os.getenv("GROK2API_HTTP_MAX_CONNECTIONS", "200") or 200)
         max_keep = int(os.getenv("GROK2API_HTTP_MAX_KEEPALIVE", "50") or 50)
+        # Keep connect timeout tight for TTFT; overall TIMEOUT still covers long streams.
+        connect_timeout = float(os.getenv("GROK2API_HTTP_CONNECT_TIMEOUT", "5") or 5)
+        connect_timeout = max(1.0, min(30.0, connect_timeout))
         _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(TIMEOUT, connect=30.0),
+            timeout=httpx.Timeout(TIMEOUT, connect=connect_timeout),
             limits=httpx.Limits(
                 max_keepalive_connections=max_keep,
                 max_connections=max_conn,
-                keepalive_expiry=30.0,
+                keepalive_expiry=60.0,
             ),
             http2=False,
         )
@@ -152,6 +155,74 @@ def _on_startup() -> None:
             print(f"  multi-account: {n_accounts} account(s) loaded")
     except Exception as e:  # noqa: BLE001
         print(f"  (auth normalize skipped: {e})")
+
+    # Warm request-path caches so the first user request doesn't pay cold pick.
+    try:
+        import time as _time
+
+        from auth import list_live_credentials
+        from settings_store import get_account_pool_state
+        import account_pool as _ap
+
+        t0 = _time.perf_counter()
+        live = list_live_credentials(include_expired=True, auto_refresh=False)
+        _ = get_account_pool_state()
+        chain = _ap.try_acquire_sequence(model=None)
+        dt = int((_time.perf_counter() - t0) * 1000)
+        print(
+            f"  pick warmup: live={len(live)} chain={len(chain)} "
+            f"took={dt}ms"
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  (pick warmup skipped: {e})")
+
+    # Warm the shared AsyncClient connection pool (TLS/TCP) in background.
+    # Using a separate temp client only warms that client, not request path.
+    try:
+        import asyncio as _asyncio
+        import threading as _threading
+
+        def _warm_upstream() -> None:
+            try:
+                base = (UPSTREAM_BASE or "").rstrip("/")
+                if not base:
+                    return
+
+                async def _run() -> None:
+                    client = await get_http_client()
+                    # Prefer a cheap probe against upstream origin.
+                    try:
+                        await client.head(base, timeout=2.5)
+                    except Exception:
+                        try:
+                            await client.get(base, timeout=2.5)
+                        except Exception:
+                            # Even a failed request usually establishes keep-alive.
+                            pass
+
+                try:
+                    _asyncio.run(_run())
+                except RuntimeError:
+                    # Nested loop / already running: best-effort sync fallback.
+                    import httpx as _httpx
+
+                    with _httpx.Client(timeout=_httpx.Timeout(2.5, connect=1.5)) as c:
+                        try:
+                            c.head(base)
+                        except Exception:
+                            try:
+                                c.get(base)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        _threading.Thread(
+            target=_warm_upstream, name="g2a-upstream-warmup", daemon=True
+        ).start()
+        print("  upstream warmup: armed")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (upstream warmup skipped: {e})")
 
     start_maintainers = True
     try:
@@ -616,6 +687,16 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
             tool_choice if isinstance(tool_choice, dict) else {"type": str(tool_choice)}
         ):
             tool_choice = "auto"
+    # Codex compact / pure-text turns often send tool_choice without tools.
+    # Upstream rejects that with 400 invalid-argument.
+    has_tools = bool(tools) or bool(req.functions)
+    if not has_tools:
+        tool_choice = None
+        parallel_tool_calls = None
+        function_call = None
+    else:
+        parallel_tool_calls = req.parallel_tool_calls
+        function_call = req.function_call
 
     optional = {
         "temperature": req.temperature,
@@ -629,9 +710,9 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
         "reasoning_effort": req.reasoning_effort,
         "tools": tools,
         "tool_choice": tool_choice,
-        "parallel_tool_calls": req.parallel_tool_calls,
+        "parallel_tool_calls": parallel_tool_calls,
         "functions": req.functions,
-        "function_call": req.function_call,
+        "function_call": function_call,
         "response_format": req.response_format,
         "n": req.n,
         # Prompt-cache request hints (OpenAI / secondary relays). Kept until
@@ -764,6 +845,8 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
             body["tools"] = cleaned
         else:
             body.pop("tools", None)
+    elif tools is not None:
+        body.pop("tools", None)
     # Legacy OpenAI `functions` array also needs parameters if present.
     funcs = body.get("functions")
     if isinstance(funcs, list):
@@ -784,11 +867,35 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
             body["functions"] = fixed_fns
         else:
             body.pop("functions", None)
+    elif funcs is not None:
+        body.pop("functions", None)
+
     tc = body.get("tool_choice")
     if isinstance(tc, dict):
         tc_type = (tc.get("type") or "function").lower()
-        if tc_type != "function":
+        if tc_type in ("auto", "none", "required", "any"):
+            # Responses / Anthropic-style {"type":"auto"} → OpenAI string form.
+            body["tool_choice"] = "required" if tc_type == "any" else tc_type
+        elif tc_type != "function":
             body["tool_choice"] = "auto"
+        else:
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = fn.get("name") or tc.get("name")
+            if name:
+                body["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": name},
+                }
+            else:
+                body["tool_choice"] = "auto"
+
+    # Codex compact / pure-text turns often send tool_choice without tools.
+    # Upstream cli-chat-proxy rejects that with 400:
+    #   "A tool_choice was set on the request but no tools were specified."
+    if not body.get("tools") and not body.get("functions"):
+        body.pop("tool_choice", None)
+        body.pop("function_call", None)
+        body.pop("parallel_tool_calls", None)
 
 
 def _ensure_stream_include_usage(body: dict[str, Any]) -> None:
@@ -1078,6 +1185,196 @@ def _reset_usage_request_ctx(token) -> None:
         _usage_request_ctx.reset(token)
     except Exception:
         pass
+
+
+def _ttft_log_enabled() -> bool:
+    """Default on. Set GROK2API_TTFT_LOG=0 to silence first-token timing logs."""
+    raw = (os.getenv("GROK2API_TTFT_LOG") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _ms_since(t0: float | None) -> int | None:
+    if t0 is None:
+        return None
+    try:
+        return max(0, int(round((time.perf_counter() - float(t0)) * 1000.0)))
+    except Exception:
+        return None
+
+
+def _short_account_id(account_id: str | None) -> str:
+    s = str(account_id or "").strip()
+    if not s:
+        return "-"
+    if "::" in s:
+        s = s.rsplit("::", 1)[-1]
+    return s[:16]
+
+
+class RequestTiming:
+    """Lightweight first-token timing for chat / responses / anthropic streams.
+
+    Logs one line when first client-visible content is produced (or on failure).
+    Env: GROK2API_TTFT_LOG=1|0  (default 1)
+    """
+
+    __slots__ = (
+        "protocol",
+        "model",
+        "stream",
+        "req_id",
+        "t0",
+        "t_affinity_done",
+        "t_pick_done",
+        "t_upstream_start",
+        "t_upstream_headers",
+        "t_first_token",
+        "account_id",
+        "chain_n",
+        "attempt",
+        "affinity",
+        "logged",
+    )
+
+    def __init__(
+        self,
+        *,
+        protocol: str,
+        model: str | None = None,
+        stream: bool = True,
+        req_id: str | None = None,
+    ) -> None:
+        self.protocol = protocol
+        self.model = model or "-"
+        self.stream = bool(stream)
+        self.req_id = (req_id or uuid.uuid4().hex[:10])[:16]
+        self.t0 = time.perf_counter()
+        self.t_affinity_done: float | None = None
+        self.t_pick_done: float | None = None
+        self.t_upstream_start: float | None = None
+        self.t_upstream_headers: float | None = None
+        self.t_first_token: float | None = None
+        self.account_id: str | None = None
+        self.chain_n = 0
+        self.attempt = 0
+        self.affinity = False
+        self.logged = False
+
+    def mark_affinity(self, prefer_account: str | None = None) -> None:
+        self.t_affinity_done = time.perf_counter()
+        self.affinity = bool(prefer_account)
+
+    def mark_pick(
+        self,
+        chain: list[Any] | None = None,
+        *,
+        elapsed_ms: float | int | None = None,
+    ) -> None:
+        # When pick runs in parallel with body build, pass elapsed_ms so the
+        # log reflects true pick cost instead of max(pick, body).
+        if elapsed_ms is not None:
+            try:
+                base = self.t_affinity_done or self.t0
+                self.t_pick_done = float(base) + max(0.0, float(elapsed_ms) / 1000.0)
+            except Exception:
+                self.t_pick_done = time.perf_counter()
+        else:
+            self.t_pick_done = time.perf_counter()
+        try:
+            self.chain_n = len(chain or [])
+        except Exception:
+            self.chain_n = 0
+
+    def mark_upstream_start(self, *, account_id: str | None = None, attempt: int = 0) -> None:
+        self.t_upstream_start = time.perf_counter()
+        self.account_id = account_id
+        self.attempt = int(attempt or 0)
+
+    def mark_upstream_headers(self) -> None:
+        if self.t_upstream_headers is None:
+            self.t_upstream_headers = time.perf_counter()
+
+    def mark_first_token(self, *, kind: str = "content") -> None:
+        if self.t_first_token is not None:
+            return
+        self.t_first_token = time.perf_counter()
+        self.emit(ok=True, first=kind)
+
+    def emit(self, *, ok: bool = True, first: str | None = None, error: str | None = None) -> None:
+        if self.logged or not _ttft_log_enabled():
+            return
+        self.logged = True
+        try:
+            total = _ms_since(self.t0)
+            aff = _ms_since(self.t0) if self.t_affinity_done is None else max(
+                0, int(round((self.t_affinity_done - self.t0) * 1000.0))
+            )
+            # pick cost measured from affinity-done (or t0 if affinity skipped)
+            pick_base = self.t_affinity_done or self.t0
+            pick = (
+                None
+                if self.t_pick_done is None
+                else max(0, int(round((self.t_pick_done - pick_base) * 1000.0)))
+            )
+            # local = time until we start upstream request
+            local = (
+                None
+                if self.t_upstream_start is None
+                else max(0, int(round((self.t_upstream_start - self.t0) * 1000.0)))
+            )
+            # upstream TTFB = headers after request start
+            up_hdr = (
+                None
+                if self.t_upstream_headers is None or self.t_upstream_start is None
+                else max(
+                    0,
+                    int(
+                        round(
+                            (self.t_upstream_headers - self.t_upstream_start) * 1000.0
+                        )
+                    ),
+                )
+            )
+            # first token after headers (model generation)
+            up_tok = (
+                None
+                if self.t_first_token is None or self.t_upstream_headers is None
+                else max(
+                    0,
+                    int(
+                        round((self.t_first_token - self.t_upstream_headers) * 1000.0)
+                    ),
+                )
+            )
+            ttft = (
+                None
+                if self.t_first_token is None
+                else max(0, int(round((self.t_first_token - self.t0) * 1000.0)))
+            )
+            parts = [
+                f"  [ttft] id={self.req_id}",
+                f"proto={self.protocol}",
+                f"model={self.model}",
+                f"stream={1 if self.stream else 0}",
+                f"ok={1 if ok else 0}",
+                f"aff={aff if aff is not None else '-'}",
+                f"pick={pick if pick is not None else '-'}",
+                f"local={local if local is not None else '-'}",
+                f"up_hdr={up_hdr if up_hdr is not None else '-'}",
+                f"up_tok={up_tok if up_tok is not None else '-'}",
+                f"ttft={ttft if ttft is not None else (total if not ok else '-')}",
+                f"chain={self.chain_n}",
+                f"try={self.attempt}",
+                f"sticky={1 if self.affinity else 0}",
+                f"acc={_short_account_id(self.account_id)}",
+            ]
+            if first:
+                parts.append(f"first={first}")
+            if error:
+                parts.append(f"err={str(error)[:160]}")
+            print(" ".join(str(p) for p in parts), flush=True)
+        except Exception:
+            pass
 
 
 def _record_usage_safe(
@@ -2191,6 +2488,48 @@ def _resolve_conversation_affinity(
     return fp, prefer
 
 
+def _pick_account_chain(
+    *,
+    model: str,
+    prefer_account_id: str | None = None,
+) -> list[GrokCredentials]:
+    """Build failover chain for one request (runs in a worker thread)."""
+    chain = account_pool.try_acquire_sequence(
+        model=model, prefer_account_id=prefer_account_id
+    )
+    if not chain:
+        chain = [account_pool.acquire(model=model)]
+    return chain
+
+
+def _pick_account_chain_timed(
+    *,
+    model: str,
+    prefer_account_id: str | None = None,
+) -> tuple[list[GrokCredentials], float]:
+    """Same as _pick_account_chain but also returns elapsed milliseconds."""
+    t0 = time.perf_counter()
+    chain = _pick_account_chain(model=model, prefer_account_id=prefer_account_id)
+    return chain, max(0.0, (time.perf_counter() - t0) * 1000.0)
+
+
+def _note_request_metrics(
+    *,
+    prefer_account: str | None,
+    conv_fp: str | None,
+) -> None:
+    try:
+        from store.metrics import inc
+
+        inc("g2a_requests_total")
+        if prefer_account:
+            inc("g2a_affinity_hits_total")
+        elif conv_fp:
+            inc("g2a_affinity_misses_total")
+    except Exception:
+        pass
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(
@@ -2204,21 +2543,26 @@ async def chat_completions(
         )
 
     key_id = _api_key_id(api_key)
+    timing = RequestTiming(protocol="openai", stream=bool(req.stream))
     conv_fp, prefer_account = await asyncio.to_thread(
         _resolve_conversation_affinity, req, request
     )
+    timing.mark_affinity(prefer_account)
     model = resolve_model(req.model)
+    timing.model = model
 
+    # Overlap account pick with body sanitize/compact so local TTFT is
+    # max(pick, body) instead of pick + body on long tool histories.
     try:
-        def _pick_chain():
-            chain = account_pool.try_acquire_sequence(
-                model=model, prefer_account_id=prefer_account
-            )
-            if not chain:
-                chain = [account_pool.acquire(model=model)]
-            return chain
-
-        chain = await asyncio.to_thread(_pick_chain)
+        (chain, pick_ms), body = await asyncio.gather(
+            asyncio.to_thread(
+                _pick_account_chain_timed,
+                model=model,
+                prefer_account_id=prefer_account,
+            ),
+            asyncio.to_thread(build_upstream_body, req, model),
+        )
+        timing.mark_pick(chain, elapsed_ms=pick_ms)
     except AuthError as e:
         try:
             from store.metrics import inc
@@ -2226,22 +2570,14 @@ async def chat_completions(
             inc("g2a_auth_failures_total")
         except Exception:
             pass
+        timing.emit(ok=False, error=str(e))
         return _client_pool_error(e)
 
-    try:
-        from store.metrics import inc
+    _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
 
-        inc("g2a_requests_total")
-        if prefer_account:
-            inc("g2a_affinity_hits_total")
-        elif conv_fp:
-            inc("g2a_affinity_misses_total")
-    except Exception:
-        pass
-
-    body = build_upstream_body(req, model)
     url = f"{UPSTREAM_BASE}/chat/completions"
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    timing.req_id = chat_id.replace("chatcmpl-", "")[:12]
     created = int(time.time())
 
     compact_hdr = _history_compact_headers(body)
@@ -2258,6 +2594,7 @@ async def chat_completions(
                 conversation_fp=conv_fp,
                 api_key_id=key_id,
                 usage_ctx=_capture_usage_request_ctx(request),
+                timing=timing,
             ),
             media_type="text/event-stream",
             headers={
@@ -2280,12 +2617,15 @@ async def chat_completions(
     used: GrokCredentials | None = None
     first_tried: str | None = chain[0].auth_key if chain else None
 
-    for creds in chain:
+    for attempt_i, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
         try:
+            timing.mark_upstream_start(account_id=creds.auth_key, attempt=attempt_i)
             content, reasoning, finish, usage, tool_calls = await _collect_completion(
                 url=url, headers=headers, body=body
             )
+            timing.mark_upstream_headers()
+            timing.mark_first_token(kind="content" if content else ("tool" if tool_calls else "done"))
             await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
             used = creds
             # Keep multi-turn memory on this account; rebind if failover
@@ -2417,6 +2757,7 @@ async def chat_completions(
     final_status = last_status if last_status < 600 else 502
     retryable = final_status in (401, 403, 429, 500, 502, 503, 504)
     friendly = _sanitize_upstream_error_message(last_error or "", final_status)
+    timing.emit(ok=False, error=friendly or last_error or "all_accounts_failed")
     if retryable:
         return openai_error(
             friendly or "所有账号暂时失败，请稍后重试",
@@ -2467,6 +2808,7 @@ async def _stream_proxy_with_failover(
     conversation_fp: str | None = None,
     api_key_id: str | None = None,
     usage_ctx: dict[str, Any] | None = None,
+    timing: RequestTiming | None = None,
 ) -> AsyncIterator[str]:
     # Do NOT emit a premature role chunk before upstream accepts — secondary
     # relays treat early chunks as stream-started and cannot safely failover.
@@ -2482,6 +2824,7 @@ async def _stream_proxy_with_failover(
             client_disconnected=client_disconnected,
             conversation_fp=conversation_fp,
             api_key_id=api_key_id,
+            timing=timing,
         ):
             yield chunk
     finally:
@@ -2499,6 +2842,7 @@ async def _stream_proxy_with_failover_inner(
     client_disconnected,
     conversation_fp: str | None = None,
     api_key_id: str | None = None,
+    timing: RequestTiming | None = None,
 ) -> AsyncIterator[str]:
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
@@ -2531,11 +2875,15 @@ async def _stream_proxy_with_failover_inner(
         # turn ends without any outbound tool frames.
         held_pre_tool: list[tuple[str | None, str | None]] = []
         try:
+            if timing is not None:
+                timing.mark_upstream_start(account_id=creds.auth_key, attempt=idx)
             upstream_body = _body_for_upstream(body)
             client = await get_http_client()
             async with client.stream(
                 "POST", url, headers=headers, json=upstream_body
             ) as resp:
+                if timing is not None:
+                    timing.mark_upstream_headers()
                 if resp.status_code >= 400:
                     err_text = (await resp.aread()).decode(
                         "utf-8", errors="replace"
@@ -2560,6 +2908,8 @@ async def _stream_proxy_with_failover_inner(
                     # try next account if retryable and more remain
                     if _retryable_status(resp.status_code) and idx < len(chain) - 1:
                         continue
+                    if timing is not None:
+                        timing.emit(ok=False, error=last_err)
                     err_payload = {
                         "id": chat_id,
                         "object": "error",
@@ -2573,24 +2923,35 @@ async def _stream_proxy_with_failover_inner(
                     yield "data: [DONE]\n\n"
                     return
 
-                await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
+                # Defer success/affinity writes until after first client bytes.
+                # These hit PG/Redis and used to block TTFT on every stream.
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        account_pool.report_success, creds.auth_key, model=model
+                    )
+                )
                 if conversation_fp:
                     if idx > 0:
-                        await asyncio.to_thread(
-                            conversation_affinity.rebind_on_failover,
-                            conversation_fp,
-                            first_tried,
-                            creds.auth_key,
+                        asyncio.create_task(
+                            asyncio.to_thread(
+                                conversation_affinity.rebind_on_failover,
+                                conversation_fp,
+                                first_tried,
+                                creds.auth_key,
+                            )
                         )
                     else:
-                        await asyncio.to_thread(
-                            conversation_affinity.bind_affinity,
-                            conversation_fp,
-                            creds.auth_key,
+                        asyncio.create_task(
+                            asyncio.to_thread(
+                                conversation_affinity.bind_affinity,
+                                conversation_fp,
+                                creds.auth_key,
+                            )
                         )
 
                 if not role_sent:
                     # Role-only delta (no empty content) — required for new-api playground.
+                    # Role alone is not counted as first token; content/tool is.
                     yield _sse_chunk(
                         chat_id=chat_id,
                         model=model,
@@ -2745,6 +3106,10 @@ async def _stream_proxy_with_failover_inner(
                             # text then tool from one mixed delta can leave the
                             # wrong content_block active ("Content block not found").
                             if emit_content or emit_reasoning:
+                                if timing is not None:
+                                    timing.mark_first_token(
+                                        kind="content" if emit_content else "reasoning"
+                                    )
                                 yield _sse_chunk(
                                     chat_id=chat_id,
                                     model=model,
@@ -2754,6 +3119,8 @@ async def _stream_proxy_with_failover_inner(
                                 )
                             if emit_tool_calls:
                                 saw_tool_calls = True
+                                if timing is not None:
+                                    timing.mark_first_token(kind="tool")
                                 _n_before = tools_emitted_count
                                 async for _tc_frame in _emit_tool_sse_serial(
                                     chat_id=chat_id,
@@ -3302,22 +3669,42 @@ async def anthropic_messages(
             err_type="invalid_request_error",
         )
 
+    timing = RequestTiming(protocol="anthropic", stream=bool(req.stream))
     conv_fp, prefer_account = await asyncio.to_thread(
         _resolve_anthropic_affinity, req, request
     )
+    timing.mark_affinity(prefer_account)
     model = resolve_model(req.model)
+    timing.model = model
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    timing.req_id = message_id.replace("msg_", "")[:12]
+
+    def _build_anthropic_body() -> dict[str, Any]:
+        body_local = anth.build_openai_chat_body(
+            req, model, force_stream=FORCE_UPSTREAM_STREAM
+        )
+        # Always stream upstream when forced; client may still want non-stream response
+        if FORCE_UPSTREAM_STREAM:
+            body_local["stream"] = True
+        # Anthropic→OpenAI conversion can omit parameters; force the same scrub as
+        # the OpenAI path so upstream never sees tools without `parameters`.
+        _sanitize_upstream_body(body_local, model=model)
+        _ensure_stream_include_usage(body_local)
+        # Same long-tool-loop compaction as OpenAI path (sub2api often hits OpenAI
+        # chat/completions, but direct Anthropic /v1/messages also benefits).
+        _apply_history_compact(body_local)
+        return body_local
 
     try:
-        def _pick_chain():
-            chain = account_pool.try_acquire_sequence(
-                model=model, prefer_account_id=prefer_account
-            )
-            if not chain:
-                chain = [account_pool.acquire(model=model)]
-            return chain
-
-        chain = await asyncio.to_thread(_pick_chain)
+        (chain, pick_ms), body = await asyncio.gather(
+            asyncio.to_thread(
+                _pick_account_chain_timed,
+                model=model,
+                prefer_account_id=prefer_account,
+            ),
+            asyncio.to_thread(_build_anthropic_body),
+        )
+        timing.mark_pick(chain, elapsed_ms=pick_ms)
     except AuthError as e:
         try:
             from store.metrics import inc
@@ -3336,30 +3723,7 @@ async def anthropic_messages(
         return _anthropic_error_response(
             detail, status=503, err_type="api_error", retry_after=8
         )
-    try:
-        from store.metrics import inc
-
-        inc("g2a_requests_total")
-        if prefer_account:
-            inc("g2a_affinity_hits_total")
-        elif conv_fp:
-            inc("g2a_affinity_misses_total")
-    except Exception:
-        pass
-
-    body = anth.build_openai_chat_body(
-        req, model, force_stream=FORCE_UPSTREAM_STREAM
-    )
-    # Always stream upstream when forced; client may still want non-stream response
-    if FORCE_UPSTREAM_STREAM:
-        body["stream"] = True
-    # Anthropic→OpenAI conversion can omit parameters; force the same scrub as
-    # the OpenAI path so upstream never sees tools without `parameters`.
-    _sanitize_upstream_body(body, model=model)
-    _ensure_stream_include_usage(body)
-    # Same long-tool-loop compaction as OpenAI path (sub2api often hits OpenAI
-    # chat/completions, but direct Anthropic /v1/messages also benefits).
-    _apply_history_compact(body)
+    _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
     url = f"{UPSTREAM_BASE}/chat/completions"
 
     compact_hdr = _history_compact_headers(body)
@@ -3375,6 +3739,7 @@ async def anthropic_messages(
                 conversation_fp=conv_fp,
                 api_key_id=key_id,
                 usage_ctx=_capture_usage_request_ctx(request),
+                timing=timing,
             ),
             media_type="text/event-stream",
             headers={
@@ -3614,9 +3979,16 @@ async def openai_responses(
     want_stream = bool(req_body.get("stream"))
     response_id = oai_resp.new_response_id()
     created_at = int(time.time())
+    timing = RequestTiming(
+        protocol="openai_responses",
+        model=model,
+        stream=want_stream,
+        req_id=response_id.replace("resp_", "")[:12],
+    )
 
     body = oai_resp.responses_request_to_chat_body(req_body, model=model)
     if not body.get("messages"):
+        timing.emit(ok=False, error="empty input")
         return openai_error(
             "input must contain at least one message",
             status=400,
@@ -3626,17 +3998,27 @@ async def openai_responses(
     conv_fp, prefer_account = await asyncio.to_thread(
         _responses_affinity, body.get("messages") or [], req_body, request
     )
+    timing.mark_affinity(prefer_account)
+
+    def _prepare_responses_body() -> dict[str, Any]:
+        # Force upstream stream collection path (same as chat non-stream clients).
+        if FORCE_UPSTREAM_STREAM:
+            body["stream"] = True
+        _sanitize_upstream_body(body, model=model)
+        _ensure_stream_include_usage(body)
+        _apply_history_compact(body)
+        return body
 
     try:
-        def _pick_chain():
-            chain = account_pool.try_acquire_sequence(
-                model=model, prefer_account_id=prefer_account
-            )
-            if not chain:
-                chain = [account_pool.acquire(model=model)]
-            return chain
-
-        chain = await asyncio.to_thread(_pick_chain)
+        (chain, pick_ms), body = await asyncio.gather(
+            asyncio.to_thread(
+                _pick_account_chain_timed,
+                model=model,
+                prefer_account_id=prefer_account,
+            ),
+            asyncio.to_thread(_prepare_responses_body),
+        )
+        timing.mark_pick(chain, elapsed_ms=pick_ms)
     except AuthError as e:
         try:
             from store.metrics import inc
@@ -3646,23 +4028,7 @@ async def openai_responses(
             pass
         return _client_pool_error(e)
 
-    try:
-        from store.metrics import inc
-
-        inc("g2a_requests_total")
-        if prefer_account:
-            inc("g2a_affinity_hits_total")
-        elif conv_fp:
-            inc("g2a_affinity_misses_total")
-    except Exception:
-        pass
-
-    # Force upstream stream collection path (same as chat non-stream clients).
-    if FORCE_UPSTREAM_STREAM:
-        body["stream"] = True
-    _sanitize_upstream_body(body, model=model)
-    _ensure_stream_include_usage(body)
-    _apply_history_compact(body)
+    _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
     url = f"{UPSTREAM_BASE}/chat/completions"
     compact_hdr = _history_compact_headers(body)
     prev_id = req_body.get("previous_response_id")
@@ -3765,61 +4131,236 @@ async def openai_responses(
     if want_stream:
         _resp_usage_ctx = _capture_usage_request_ctx(request)
 
-        async def _sse_gen() -> AsyncIterator[str]:
-            _usage_tok = _bind_usage_request_ctx(_resp_usage_ctx)
-            try:
-                try:
-                    content, reasoning, _finish, usage, tool_calls, creds = (
-                        await _run_with_failover()
-                    )
-                except RuntimeError as e:
-                    for frame in oai_resp.failed_responses_sse(
-                        response_id=response_id, message=str(e)
-                    ):
-                        yield frame
-                    return
-                except Exception as e:  # noqa: BLE001
-                    for frame in oai_resp.failed_responses_sse(
-                        response_id=response_id, message=f"Proxy error: {e}"
-                    ):
-                        yield frame
-                    return
+        async def _sse_gen_live() -> AsyncIterator[str]:
+            """True Responses streaming: first token as soon as upstream emits.
 
-                ledger_usage = _usage_from_body_and_output(
-                    body,
-                    content=content or "",
-                    reasoning=reasoning or "",
-                    tool_calls=tool_calls,
-                    usage=usage,
-                )
-                _record_usage_safe(
-                    usage=ledger_usage,
-                    ok=True,
-                    api_key_id=key_id,
-                    account_id=creds.auth_key,
-                    model=model,
-                    protocol="openai_responses",
-                    stream=True,
-                )
-                for frame in oai_resp.iter_responses_sse_from_completion(
+            Old path collected the full chat completion then replayed SSE, so
+            TTFT equaled full completion latency for every sub2api client.
+            """
+            _usage_tok = _bind_usage_request_ctx(_resp_usage_ctx)
+            last_error: str | None = None
+            first_tried: str | None = chain[0].auth_key if chain else None
+            try:
+                for idx, creds in enumerate(chain):
+                    headers = upstream_headers(creds.token, model)
+                    streamer = oai_resp.ResponsesLiveStreamer(
+                        response_id=response_id,
+                        model=model,
+                        created_at=created_at,
+                        previous_response_id=str(prev_id) if prev_id else None,
+                        metadata=metadata,
+                    )
+                    content_parts: list[str] = []
+                    reasoning_parts: list[str] = []
+                    tool_acc: dict[int, dict[str, Any]] = {}
+                    usage: dict[str, Any] | None = None
+                    stream_started = False
+                    try:
+                        timing.mark_upstream_start(
+                            account_id=creds.auth_key, attempt=idx
+                        )
+                        upstream_body = _body_for_upstream(body)
+                        client = await get_http_client()
+                        async with client.stream(
+                            "POST", url, headers=headers, json=upstream_body
+                        ) as resp:
+                            timing.mark_upstream_headers()
+                            if resp.status_code >= 400:
+                                err_text = (await resp.aread()).decode(
+                                    "utf-8", errors="replace"
+                                )[:1500]
+                                await asyncio.to_thread(
+                                    account_pool.report_failure,
+                                    creds.auth_key,
+                                    error=err_text,
+                                    status_code=resp.status_code,
+                                    model=model,
+                                    headers=dict(resp.headers),
+                                )
+                                _record_usage_safe(
+                                    ok=False,
+                                    api_key_id=key_id,
+                                    account_id=creds.auth_key,
+                                    model=model,
+                                    protocol="openai_responses",
+                                    stream=True,
+                                )
+                                last_error = (
+                                    f"Upstream {resp.status_code}: {err_text}"
+                                )
+                                if (
+                                    _retryable_status(resp.status_code)
+                                    and idx < len(chain) - 1
+                                    and not stream_started
+                                ):
+                                    continue
+                                for frame in oai_resp.failed_responses_sse(
+                                    response_id=response_id,
+                                    message=_sanitize_upstream_error_message(
+                                        last_error, resp.status_code
+                                    )
+                                    or last_error,
+                                ):
+                                    yield frame
+                                return
+
+                            # Bookkeeping after upstream accepted — never block TTFT.
+                            asyncio.create_task(
+                                asyncio.to_thread(
+                                    account_pool.report_success,
+                                    creds.auth_key,
+                                    model=model,
+                                )
+                            )
+                            if conv_fp:
+                                if prefer_account and prefer_account != creds.auth_key:
+                                    asyncio.create_task(
+                                        asyncio.to_thread(
+                                            conversation_affinity.rebind_on_failover,
+                                            conv_fp,
+                                            first_tried,
+                                            creds.auth_key,
+                                        )
+                                    )
+                                else:
+                                    asyncio.create_task(
+                                        asyncio.to_thread(
+                                            conversation_affinity.bind_affinity,
+                                            conv_fp,
+                                            creds.auth_key,
+                                        )
+                                    )
+
+                            # Emit response.created ASAP (before waiting on first delta).
+                            for frame in streamer.start():
+                                stream_started = True
+                                yield frame
+
+                            ctype = (resp.headers.get("content-type") or "").lower()
+                            if "text/event-stream" in ctype or "stream" in ctype:
+                                async for line in _aiter_sse_lines_with_keepalive(resp):
+                                    if await request.is_disconnected():
+                                        return
+                                    if line is None:
+                                        yield _sse_keepalive()
+                                        continue
+                                    parsed = _parse_sse_line(line)
+                                    if parsed is None:
+                                        continue
+                                    if parsed == "[DONE]":
+                                        break
+                                    assert isinstance(parsed, dict)
+                                    if isinstance(parsed.get("usage"), dict):
+                                        usage = parsed["usage"]
+                                    content, reasoning, tool_calls = _extract_delta_parts(
+                                        parsed
+                                    )
+                                    if content:
+                                        content_parts.append(content)
+                                        timing.mark_first_token(kind="content")
+                                        for frame in streamer.on_text_delta(content):
+                                            yield frame
+                                    if reasoning:
+                                        reasoning_parts.append(reasoning)
+                                        # Keep reasoning internal; Responses clients
+                                        # primarily need output_text / function_call.
+                                    if tool_calls:
+                                        _merge_tool_call_delta(
+                                            tool_acc, tool_calls
+                                        )
+                                        timing.mark_first_token(kind="tool")
+                                        for frame in streamer.on_tool_delta(
+                                            tool_calls
+                                        ):
+                                            yield frame
+                            else:
+                                # Rare non-SSE upstream response: fall back to one-shot.
+                                raw = await resp.aread()
+                                data = json.loads(raw)
+                                if isinstance(data.get("usage"), dict):
+                                    usage = data["usage"]
+                                choices = data.get("choices") or []
+                                if choices:
+                                    msg = (choices[0] or {}).get("message") or {}
+                                    c = msg.get("content") or ""
+                                    r = msg.get("reasoning_content") or ""
+                                    if c:
+                                        content_parts.append(c)
+                                        for frame in streamer.on_text_delta(c):
+                                            yield frame
+                                    if r:
+                                        reasoning_parts.append(r)
+                                    tcs = msg.get("tool_calls")
+                                    if isinstance(tcs, list) and tcs:
+                                        for frame in streamer.on_tool_delta(
+                                            [
+                                                {
+                                                    "index": i,
+                                                    "id": tc.get("id"),
+                                                    "type": "function",
+                                                    "function": tc.get("function")
+                                                    or {},
+                                                }
+                                                for i, tc in enumerate(tcs)
+                                                if isinstance(tc, dict)
+                                            ]
+                                        ):
+                                            yield frame
+
+                            tool_calls_final = _finalize_tool_calls(tool_acc)
+                            ledger_usage = _usage_from_body_and_output(
+                                body,
+                                content="".join(content_parts),
+                                reasoning="".join(reasoning_parts),
+                                tool_calls=tool_calls_final,
+                                usage=usage,
+                            )
+                            _record_usage_safe(
+                                usage=ledger_usage,
+                                ok=True,
+                                api_key_id=key_id,
+                                account_id=creds.auth_key,
+                                model=model,
+                                protocol="openai_responses",
+                                stream=True,
+                            )
+                            for frame in streamer.complete(
+                                usage=ledger_usage,
+                                reasoning="".join(reasoning_parts),
+                            ):
+                                if await request.is_disconnected():
+                                    return
+                                yield frame
+                            return
+                    except Exception as e:  # noqa: BLE001
+                        if stream_started:
+                            for frame in oai_resp.failed_responses_sse(
+                                response_id=response_id,
+                                message=f"Proxy error: {e}",
+                            ):
+                                yield frame
+                            return
+                        await asyncio.to_thread(
+                            account_pool.report_failure,
+                            creds.auth_key,
+                            error=str(e),
+                            status_code=502,
+                            model=model,
+                        )
+                        last_error = f"Proxy error: {e}"
+                        continue
+                for frame in oai_resp.failed_responses_sse(
                     response_id=response_id,
-                    model=model,
-                    content=content or "",
-                    reasoning=reasoning or "",
-                    tool_calls=tool_calls,
-                    usage=ledger_usage,
-                    created_at=created_at,
-                    previous_response_id=str(prev_id) if prev_id else None,
-                    metadata=metadata,
+                    message=_sanitize_upstream_error_message(last_error or "", 502)
+                    or last_error
+                    or "All accounts failed",
                 ):
-                    if await request.is_disconnected():
-                        return
                     yield frame
             finally:
                 _reset_usage_request_ctx(_usage_tok)
 
         return StreamingResponse(
-            _sse_gen(),
+            _sse_gen_live(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -3904,6 +4445,7 @@ async def _stream_anthropic_with_failover(
     conversation_fp: str | None = None,
     api_key_id: str | None = None,
     usage_ctx: dict[str, Any] | None = None,
+    timing: RequestTiming | None = None,
 ) -> AsyncIterator[str]:
     """Upstream OpenAI SSE → Anthropic Messages SSE with account failover."""
     _usage_tok = _bind_usage_request_ctx(usage_ctx)
@@ -3917,6 +4459,7 @@ async def _stream_anthropic_with_failover(
             client_disconnected=client_disconnected,
             conversation_fp=conversation_fp,
             api_key_id=api_key_id,
+            timing=timing,
         ):
             yield chunk
     finally:
@@ -3933,6 +4476,7 @@ async def _stream_anthropic_with_failover_inner(
     client_disconnected,
     conversation_fp: str | None = None,
     api_key_id: str | None = None,
+    timing: RequestTiming | None = None,
 ) -> AsyncIterator[str]:
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
@@ -3961,10 +4505,14 @@ async def _stream_anthropic_with_failover_inner(
         usage: dict[str, Any] | None = None
         held_finish: str | None = None
         try:
+            if timing is not None:
+                timing.mark_upstream_start(account_id=creds.auth_key, attempt=idx)
             client = await get_http_client()
             async with client.stream(
                 "POST", url, headers=headers, json=upstream_body
             ) as resp:
+                if timing is not None:
+                    timing.mark_upstream_headers()
                 if resp.status_code >= 400:
                     err_text = (await resp.aread()).decode(
                         "utf-8", errors="replace"
@@ -3990,25 +4538,36 @@ async def _stream_anthropic_with_failover_inner(
                         chain
                     ) - 1:
                         continue
+                    if timing is not None:
+                        timing.emit(ok=False, error=last_err)
                     yield anth.anthropic_stream_error(
                         last_err, err_type="api_error"
                     )
                     return
 
-                await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
+                # Don't block first Anthropic event on PG/Redis bookkeeping.
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        account_pool.report_success, creds.auth_key, model=model
+                    )
+                )
                 if conversation_fp:
                     if idx > 0:
-                        await asyncio.to_thread(
-                            conversation_affinity.rebind_on_failover,
-                            conversation_fp,
-                            first_tried,
-                            creds.auth_key,
+                        asyncio.create_task(
+                            asyncio.to_thread(
+                                conversation_affinity.rebind_on_failover,
+                                conversation_fp,
+                                first_tried,
+                                creds.auth_key,
+                            )
                         )
                     else:
-                        await asyncio.to_thread(
-                            conversation_affinity.bind_affinity,
-                            conversation_fp,
-                            creds.auth_key,
+                        asyncio.create_task(
+                            asyncio.to_thread(
+                                conversation_affinity.bind_affinity,
+                                conversation_fp,
+                                creds.auth_key,
+                            )
                         )
 
                 # message_start first — only after upstream accepted
@@ -4055,6 +4614,16 @@ async def _stream_anthropic_with_failover_inner(
                             usage = parsed["usage"]
                             continue
                         if content or reasoning or tool_calls:
+                            if timing is not None and (
+                                content or tool_calls or reasoning
+                            ):
+                                timing.mark_first_token(
+                                    kind=(
+                                        "content"
+                                        if content
+                                        else ("tool" if tool_calls else "reasoning")
+                                    )
+                                )
                             async for ev in _yield_anthropic_events_serial(
                                 assembler.feed(
                                     content=content or None,

@@ -82,9 +82,12 @@ def _next_wait_seconds() -> float:
     rem = _min_remaining_seconds()
     if rem is None:
         return base
-    # Within 15 minutes of expiry → check every 60s
+    # Already expired (or past skew) → retry aggressively.
+    if rem <= 0:
+        return min(base, 30.0)
+    # Within 15 minutes of expiry → check every 45s
     if rem <= 15 * 60:
-        return min(base, 60.0)
+        return min(base, 45.0)
     # Within 1 hour → check every 2 minutes
     if rem <= 3600:
         return min(base, 120.0)
@@ -122,15 +125,37 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
             from oidc_auth import normalize_auth_file_keys, refresh_all_accounts
 
             result["normalized"] = normalize_auth_file_keys()
+            # Opportunistic purge of permanently unusable accounts:
+            # refresh_invalid marks, no-RT+no-access, no-RT+access-expired.
+            try:
+                from oidc_auth import purge_refresh_invalid_accounts
+
+                purged = purge_refresh_invalid_accounts(dry_run=False)
+                result["purged_dead"] = {
+                    "deleted": int((purged or {}).get("deleted") or 0),
+                    "by_reason": (purged or {}).get("by_reason") or {},
+                }
+            except Exception as e:  # noqa: BLE001
+                result["purged_dead"] = {"deleted": 0, "error": str(e)[:200]}
             # force: still only-near-expiry=False, but max_accounts batch applies
-            skew = max(300.0, _skew() * 2)
+            # Background cycles use a generous skew so already-expired tokens are
+            # always candidates; near-expiry (~15m) is also included.
+            skew = max(900.0, _skew() * 4)
             # force: refresh even far-from-expiry, but still batch-capped so one
             # admin click never rewrites 700 accounts at once on WSL.
             try:
                 from config import TOKEN_REFRESH_BATCH
             except Exception:
-                TOKEN_REFRESH_BATCH = 20
-            force_batch = min(TOKEN_REFRESH_BATCH * 2, 80) if force else TOKEN_REFRESH_BATCH
+                TOKEN_REFRESH_BATCH = 40
+            # Prefer larger batches when many tokens are already expired so the
+            # pool recovers faster instead of only refreshing 20-40/cycle.
+            rem = _min_remaining_seconds(force=True)
+            if force:
+                force_batch = min(max(TOKEN_REFRESH_BATCH * 2, 40), 120)
+            elif rem is not None and rem <= 0:
+                force_batch = min(max(TOKEN_REFRESH_BATCH * 2, 40), 100)
+            else:
+                force_batch = TOKEN_REFRESH_BATCH
             refresh = refresh_all_accounts(
                 only_near_expiry=not force,
                 skew_seconds=skew if not force else 365 * 86400.0,

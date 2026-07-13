@@ -39,9 +39,10 @@ services:
       - path: .env
         required: false
     ports:
+      # Only the app API is published. Postgres/Redis stay internal-only
+      # (compose network). Inline Turnstile Solver listens on container
+      # loopback 127.0.0.1:5072 and is NOT published to the host.
       - "3000:3000"
-      # optional external access to inline solver API
-      - "5072:5072"
     shm_size: "1gb"
     security_opt:
       - seccomp:unconfined

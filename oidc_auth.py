@@ -334,6 +334,81 @@ def _is_permanent_refresh_failure(status_code: int, body: str) -> bool:
     )
 
 
+def delete_account_for_refresh_failure(
+    account_id: str,
+    *,
+    reason: str = "refresh_token permanently invalid",
+) -> dict[str, Any]:
+    """Immediately remove one permanently-invalid RT account from durable store.
+
+    Used by request-path refresh failures so dead accounts do not linger until
+    the next background maintainer cycle.
+    """
+    aid = str(account_id or "").strip()
+    if not aid:
+        return {"ok": False, "deleted": False, "error": "missing account id"}
+    reason_s = str(reason or "refresh_token permanently invalid")[:300]
+    try:
+        from accounts import remove_account
+
+        removed = bool(remove_account(aid))
+    except Exception as e:  # noqa: BLE001
+        # Fallback: direct map rewrite if accounts helper is unavailable.
+        try:
+            def _apply(m: dict[str, Any]) -> None:
+                if aid in m:
+                    m.pop(aid, None)
+                    return
+                # best-effort suffix / user_id match
+                for k, v in list(m.items()):
+                    if k == aid or k.endswith(f"::{aid}"):
+                        m.pop(k, None)
+                        continue
+                    if isinstance(v, dict) and (
+                        v.get("user_id") == aid or v.get("principal_id") == aid
+                    ):
+                        m.pop(k, None)
+
+            mutate_auth_map(_apply)
+            removed = True
+        except Exception as e2:  # noqa: BLE001
+            return {
+                "ok": False,
+                "deleted": False,
+                "id": aid,
+                "error": f"delete failed: {e}; fallback: {e2}"[:300],
+            }
+
+    # Pool / redis cleanup (accounts.remove_account already does this; keep
+    # best-effort extra pass for the fallback path).
+    try:
+        from settings_store import get_account_pool_state, save_account_pool_state
+
+        state = get_account_pool_state()
+        if aid in state:
+            state.pop(aid, None)
+            save_account_pool_state(state)
+    except Exception:
+        pass
+    try:
+        from store.pool_redis import clear_cooldown
+
+        clear_cooldown(aid)
+    except Exception:
+        pass
+    if removed:
+        print(
+            f"  [token-refresh] deleted account={aid[:64]} reason={reason_s[:120]}",
+            flush=True,
+        )
+    return {
+        "ok": True,
+        "deleted": bool(removed),
+        "id": aid,
+        "reason": reason_s,
+    }
+
+
 def refresh_access_token(
     entry: dict[str, Any],
     *,
@@ -439,11 +514,20 @@ def ensure_fresh_entry(
     entry: dict[str, Any],
     *,
     skew_seconds: float = 120.0,
+    raise_on_error: bool = False,
 ) -> dict[str, Any]:
-    """Refresh if expired / near expiry and refresh_token exists."""
+    """Refresh if expired / near expiry and refresh_token exists.
+
+    By default swallows transient errors so callers can fall back. Pass
+    ``raise_on_error=True`` when the access token is already expired and the
+    caller cannot proceed with a stale token.
+
+    Permanent RT failures (invalid_grant / revoked) delete the account immediately.
+    """
     token = entry.get("key")
     exp = parse_expires_at(entry.get("expires_at"), token if isinstance(token, str) else None)
     now = time.time()
+    already_expired = exp is not None and exp <= now
     if exp is not None and exp > now + skew_seconds:
         return entry
     if not entry.get("refresh_token"):
@@ -451,7 +535,12 @@ def ensure_fresh_entry(
     try:
         result = refresh_and_persist(account_id, entry)
         return result["entry"]
+    except RefreshRevokedError as e:
+        delete_account_for_refresh_failure(account_id, reason=str(e))
+        raise
     except Exception:
+        if raise_on_error or already_expired:
+            raise
         return entry
 
 
@@ -945,14 +1034,19 @@ def refresh_all_accounts(
         for missing in sorted(wanted - existing):
             results.append({"id": missing, "ok": False, "error": "account_not_found"})
 
-    # Prefer soonest-expiring accounts first when batch-capped
-    def _exp_key(item: tuple[str, dict[str, Any]]) -> float:
-        aid, entry = item
+    # Prefer already-expired, then soonest-expiring accounts when batch-capped.
+    # Missing expires_at sorts last among non-expired so known-dead tokens go first.
+    def _exp_key(item: tuple[str, dict[str, Any]]) -> tuple[int, float]:
+        _aid, entry = item
         token = entry.get("key")
         exp = parse_expires_at(
             entry.get("expires_at"), token if isinstance(token, str) else None
         )
-        return float(exp) if exp is not None else 0.0
+        if exp is None:
+            return (2, float("inf"))
+        if float(exp) <= now:
+            return (0, float(exp))
+        return (1, float(exp))
 
     candidates.sort(key=_exp_key)
     deferred = 0
@@ -1057,12 +1151,19 @@ def refresh_all_accounts(
             reason = str(e)[:300]
             with updates_lock:
                 invalid_marks[aid] = reason
+            # Also drop immediately via shared helper so pool/redis cleanup is
+            # consistent even if the later batch map rewrite is interrupted.
+            try:
+                delete_account_for_refresh_failure(aid, reason=reason)
+            except Exception:
+                pass
             return {
                 "id": aid,
                 "ok": False,
                 "error": reason,
                 "permanent": True,
                 "reason": "refresh_invalid",
+                "deleted": True,
             }
         except Exception as e:  # noqa: BLE001
             return {"id": aid, "ok": False, "error": str(e)[:300]}
@@ -1227,13 +1328,20 @@ def refresh_all_accounts(
 
 
 def purge_refresh_invalid_accounts(*, dry_run: bool = False) -> dict[str, Any]:
-    """Delete all accounts already marked refresh_invalid (or equivalent).
+    """Delete permanently unusable accounts.
 
-    Used once after upgrading from "mark invalid" → "delete permanently", and
-    can be re-run safely (idempotent).
+    Removes:
+      1. accounts already marked ``refresh_invalid``
+      2. accounts with neither refresh_token nor access token
+      3. accounts with no refresh_token whose access token is already expired
+         (or missing expires_at and unusable)
+
+    Safe to re-run (idempotent). Used at startup and by the background
+    token maintainer.
     """
     data = read_auth_map()
     doomed: list[tuple[str, str]] = []
+    now = time.time()
     for aid, entry in list(data.items()):
         if not isinstance(entry, dict):
             continue
@@ -1245,9 +1353,25 @@ def purge_refresh_invalid_accounts(*, dry_run: bool = False) -> dict[str, Any]:
                 )
             )
             continue
-        # No refresh_token and no usable access token → dead weight
-        if not entry.get("refresh_token") and not entry.get("key"):
+
+        has_rt = bool(entry.get("refresh_token"))
+        token = entry.get("key") if isinstance(entry.get("key"), str) else None
+        has_access = bool(token)
+        if not has_rt and not has_access:
             doomed.append((aid, "no_refresh_token_and_no_access_token"))
+            continue
+        if not has_rt:
+            # No RT: if access is already expired (or cannot be parsed as live),
+            # this account can never be renewed — delete it.
+            exp = parse_expires_at(entry.get("expires_at"), token)
+            if exp is None:
+                # No expires_at and no RT — treat as dead weight once access is
+                # missing/empty; if access exists without exp we keep it (rare).
+                if not has_access:
+                    doomed.append((aid, "no_refresh_token_and_no_expiry"))
+                continue
+            if float(exp) <= now:
+                doomed.append((aid, "no_refresh_token_and_access_expired"))
 
     if dry_run:
         return {
@@ -1258,7 +1382,7 @@ def purge_refresh_invalid_accounts(*, dry_run: bool = False) -> dict[str, Any]:
             "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
         }
     if not doomed:
-        return {"ok": True, "deleted": 0, "ids": []}
+        return {"ok": True, "deleted": 0, "ids": [], "sample": []}
 
     ids = [a for a, _ in doomed]
     try:
@@ -1297,12 +1421,19 @@ def purge_refresh_invalid_accounts(*, dry_run: bool = False) -> dict[str, Any]:
         except Exception:
             pass
 
+    by_reason: dict[str, int] = {}
+    for _aid, reason in doomed:
+        key = str(reason or "unknown").split(":")[0][:64]
+        by_reason[key] = by_reason.get(key, 0) + 1
     print(
         f"  [token-refresh] purged {len(removed)} permanently invalid account(s)"
+        + (f" reasons={by_reason}" if by_reason else ""),
+        flush=True,
     )
     return {
         "ok": True,
         "deleted": len(removed),
         "ids": removed[:100],
         "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
+        "by_reason": by_reason,
     }

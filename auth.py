@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from auth_store import read_auth_map
+from auth_store import read_auth_entry, read_auth_map
 from config import (
     AUTH_FILE,
     CLI_VERSION,
@@ -132,6 +134,48 @@ def _pick_entry(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return name, entry
 
 
+# Short process-local cache for request-path account picks. Large pools spend
+# multi-seconds re-hydrating 1k+ credentials on every request otherwise.
+_live_creds_cache_lock = threading.RLock()
+_live_creds_cache: dict[str, Any] = {
+    "at": 0.0,
+    "path": None,
+    "include_expired": None,
+    "creds": None,
+}
+_LIVE_CREDS_CACHE_TTL = float(os.getenv("GROK2API_LIVE_CREDS_CACHE_TTL", "2.0") or 2.0)
+
+
+def invalidate_live_credentials_cache() -> None:
+    with _live_creds_cache_lock:
+        _live_creds_cache["at"] = 0.0
+        _live_creds_cache["creds"] = None
+
+
+def get_cached_live_credentials(
+    path: Path | None = None,
+    *,
+    include_expired: bool = False,
+) -> list[GrokCredentials] | None:
+    """Return warm process-local live-creds cache only (no rebuild / no IO).
+
+    Used by sticky TTFT fast path so multi-turn picks never pay a cold full-pool
+    scan just to assemble optional failover backups.
+    """
+    path = path or AUTH_FILE
+    now = time.time()
+    with _live_creds_cache_lock:
+        if (
+            _live_creds_cache.get("creds") is not None
+            and _live_creds_cache.get("path") == str(path)
+            and bool(_live_creds_cache.get("include_expired")) == bool(include_expired)
+            and now - float(_live_creds_cache.get("at") or 0.0)
+            < max(0.2, _LIVE_CREDS_CACHE_TTL)
+        ):
+            return list(_live_creds_cache["creds"])
+    return None
+
+
 def list_live_credentials(
     path: Path | None = None,
     *,
@@ -146,6 +190,21 @@ def list_live_credentials(
     wrote only to PostgreSQL.
     """
     path = path or AUTH_FILE
+    # Request path never network-refreshes here; cache by include_expired only.
+    cached = get_cached_live_credentials(path, include_expired=include_expired)
+    if cached is not None:
+        return cached
+    now = time.time()
+    with _live_creds_cache_lock:
+        if (
+            _live_creds_cache.get("creds") is not None
+            and _live_creds_cache.get("path") == str(path)
+            and bool(_live_creds_cache.get("include_expired")) == bool(include_expired)
+            and now - float(_live_creds_cache.get("at") or 0.0) < max(0.2, _LIVE_CREDS_CACHE_TTL)
+        ):
+            # Return a shallow copy so callers can reorder safely.
+            return list(_live_creds_cache["creds"])
+
     try:
         data = _read_auth(path)
     except AuthError:
@@ -154,11 +213,9 @@ def list_live_credentials(
     # IMPORTANT: never fan-out refresh across the whole pool here.
     # With 700+ accounts this used to open hundreds of OIDC calls + rewrite
     # auth.json per account and freeze WSL. Background token_maintainer owns
-    # bulk refresh; here we only refresh on demand for already-expired entries
-    # when explicitly requested, and only a small number per call.
+    # bulk refresh. Request path must stay O(n) pure CPU over the map — any
+    # network refresh here directly inflates TTFT / first-token latency.
     out: list[GrokCredentials] = []
-    refreshed = 0
-    max_inline_refresh = 3 if auto_refresh else 0
     for name, entry, _exp in _iter_entries(data):
         try:
             creds = _entry_to_creds(name, entry)
@@ -166,26 +223,15 @@ def list_live_credentials(
             continue
         # still usable if has refresh_token even when access near-expired
         if include_expired or not creds.expired or creds.refresh_token:
-            if (
-                auto_refresh
-                and creds.expired
-                and creds.refresh_token
-                and refreshed < max_inline_refresh
-            ):
-                # only hard-refresh a tiny number of already-expired entries
-                try:
-                    from oidc_auth import refresh_and_persist
-
-                    r = refresh_and_persist(name, entry)
-                    creds = _entry_to_creds(r["account_id"], r["entry"])
-                    refreshed += 1
-                except Exception:
-                    if not include_expired:
-                        continue
             if include_expired or not creds.expired:
                 out.append(creds)
     # newest expiry first for stable ordering
     out.sort(key=lambda c: c.expires_at or 0.0, reverse=True)
+    with _live_creds_cache_lock:
+        _live_creds_cache["at"] = time.time()
+        _live_creds_cache["path"] = str(path)
+        _live_creds_cache["include_expired"] = bool(include_expired)
+        _live_creds_cache["creds"] = list(out)
     return out
 
 
@@ -199,26 +245,71 @@ def load_credentials(
 
     # auto refresh if needed
     try:
-        from oidc_auth import ensure_fresh_entry
+        from oidc_auth import ensure_fresh_entry, parse_expires_at as _parse_exp
 
-        entry = ensure_fresh_entry(name, entry, skew_seconds=TOKEN_REFRESH_SKEW)
+        tok0 = entry.get("key") if isinstance(entry.get("key"), str) else None
+        exp0 = _parse_exp(entry.get("expires_at"), tok0)
+        must_refresh = exp0 is not None and exp0 <= time.time()
+        entry = ensure_fresh_entry(
+            name,
+            entry,
+            skew_seconds=TOKEN_REFRESH_SKEW,
+            raise_on_error=must_refresh,
+        )
         # re-read id if remounted
         data = _read_auth(path)
         name, entry = _pick_entry(data)
-    except Exception:
-        pass
+    except Exception as e:
+        # Permanent RT failures already delete inside ensure_fresh_entry.
+        # Still surface a clear AuthError for the request path.
+        try:
+            from oidc_auth import RefreshRevokedError, parse_expires_at as _parse_exp2
+
+            if isinstance(e, RefreshRevokedError):
+                raise AuthError(
+                    f"Token expired and refresh permanently failed: {e}. Re-login or import."
+                ) from e
+            tok1 = entry.get("key") if isinstance(entry.get("key"), str) else None
+            exp1 = _parse_exp2(entry.get("expires_at"), tok1)
+            if exp1 is not None and exp1 <= time.time() and entry.get("refresh_token"):
+                raise AuthError(
+                    f"Token expired and refresh failed: {e}. Re-login or import."
+                ) from e
+        except AuthError:
+            raise
+        except Exception:
+            pass
 
     creds = _entry_to_creds(name, entry)
     if creds.expired and not creds.refresh_token:
+        # No RT and access already dead — drop so it cannot be reselected.
+        try:
+            from oidc_auth import delete_account_for_refresh_failure
+
+            delete_account_for_refresh_failure(
+                name, reason="no_refresh_token_and_access_expired"
+            )
+        except Exception:
+            pass
         raise AuthError(
             "Session token expired. Use device-code login or import a fresh token."
         )
     if creds.expired and creds.refresh_token:
         try:
-            from oidc_auth import refresh_and_persist
+            from oidc_auth import RefreshRevokedError, refresh_and_persist
 
             r = refresh_and_persist(name, entry)
             creds = _entry_to_creds(r["account_id"], r["entry"])
+        except RefreshRevokedError as e:
+            try:
+                from oidc_auth import delete_account_for_refresh_failure
+
+                delete_account_for_refresh_failure(name, reason=str(e))
+            except Exception:
+                pass
+            raise AuthError(
+                f"Token expired and refresh permanently failed: {e}. Re-login or import."
+            ) from e
         except Exception as e:
             raise AuthError(
                 f"Token expired and refresh failed: {e}. Re-login or import."
@@ -226,49 +317,154 @@ def load_credentials(
     return creds
 
 
+def peek_credentials_by_id(
+    account_id: str, path: Path | None = None
+) -> GrokCredentials | None:
+    """Read one account without OIDC refresh (sticky TTFT fast path).
+
+    Returns None when the account is missing or has no usable access token.
+    Expired-but-refreshable accounts are still returned so callers can decide
+    whether to pay for refresh or fall back to full pool pick.
+    """
+    if not account_id:
+        return None
+    path = path or AUTH_FILE
+    try:
+        hit = read_auth_entry(str(account_id), path)
+    except Exception:
+        hit = None
+    if hit is None:
+        # Last resort: full map (file backend / cold PG cache).
+        try:
+            data = _read_auth(path)
+        except AuthError:
+            return None
+        entry = data.get(account_id)
+        resolved = str(account_id)
+        if not isinstance(entry, dict):
+            for k, v in data.items():
+                if isinstance(v, dict) and (
+                    k == account_id
+                    or v.get("user_id") == account_id
+                    or v.get("principal_id") == account_id
+                    or str(k).endswith(f"::{account_id}")
+                ):
+                    entry = v
+                    resolved = str(k)
+                    break
+            else:
+                return None
+        else:
+            resolved = str(account_id)
+    else:
+        resolved, entry = hit
+    try:
+        return _entry_to_creds(resolved, entry)
+    except AuthError:
+        return None
+
+
 def load_credentials_by_id(account_id: str, path: Path | None = None) -> GrokCredentials:
     path = path or AUTH_FILE
-    data = _read_auth(path)
-    entry = data.get(account_id)
-    if not isinstance(entry, dict):
-        # try match by user_id suffix
-        for k, v in data.items():
-            if isinstance(v, dict) and (
-                k == account_id
-                or v.get("user_id") == account_id
-                or k.endswith(f"::{account_id}")
-            ):
-                entry = v
-                account_id = k
-                break
-        else:
-            raise AuthError(f"Account not found: {account_id}")
+    # Prefer single-account read so sticky multi-turn requests don't re-scan
+    # the whole accounts table on every turn (dominant pick cost on large pools).
+    hit = None
+    try:
+        hit = read_auth_entry(str(account_id), path)
+    except Exception:
+        hit = None
+    if hit is not None:
+        account_id, entry = hit
+    else:
+        data = _read_auth(path)
+        entry = data.get(account_id)
+        if not isinstance(entry, dict):
+            # try match by user_id suffix
+            for k, v in data.items():
+                if isinstance(v, dict) and (
+                    k == account_id
+                    or v.get("user_id") == account_id
+                    or k.endswith(f"::{account_id}")
+                ):
+                    entry = v
+                    account_id = k
+                    break
+            else:
+                raise AuthError(f"Account not found: {account_id}")
 
     try:
-        from oidc_auth import ensure_fresh_entry
+        from oidc_auth import ensure_fresh_entry, parse_expires_at as _parse_exp
 
-        entry = ensure_fresh_entry(account_id, entry, skew_seconds=TOKEN_REFRESH_SKEW)
-        # account_id may have changed after remount
-        data = _read_auth(path)
-        if account_id not in data:
-            for k, v in data.items():
-                if isinstance(v, dict) and v.get("user_id") == entry.get("user_id"):
-                    account_id = k
-                    entry = v
-                    break
-    except Exception:
-        pass
+        tok0 = entry.get("key") if isinstance(entry.get("key"), str) else None
+        exp0 = _parse_exp(entry.get("expires_at"), tok0)
+        must_refresh = exp0 is not None and exp0 <= time.time()
+        entry = ensure_fresh_entry(
+            account_id,
+            entry,
+            skew_seconds=TOKEN_REFRESH_SKEW,
+            raise_on_error=must_refresh,
+        )
+        # account_id may have changed after remount — only re-resolve if needed.
+        if not isinstance(entry, dict) or not (
+            entry.get("key") or entry.get("access_token") or entry.get("token")
+        ):
+            data = _read_auth(path)
+            if account_id not in data:
+                for k, v in data.items():
+                    if isinstance(v, dict) and v.get("user_id") == (
+                        entry.get("user_id") if isinstance(entry, dict) else None
+                    ):
+                        account_id = k
+                        entry = v
+                        break
+            else:
+                entry = data.get(account_id) or entry
+    except Exception as e:
+        try:
+            from oidc_auth import RefreshRevokedError, parse_expires_at as _parse_exp2
+
+            if isinstance(e, RefreshRevokedError):
+                raise AuthError(
+                    f"Account token expired / refresh permanently failed: {e}"
+                ) from e
+            tok1 = entry.get("key") if isinstance(entry.get("key"), str) else None
+            exp1 = _parse_exp2(entry.get("expires_at"), tok1)
+            if exp1 is not None and exp1 <= time.time() and entry.get("refresh_token"):
+                raise AuthError(f"Account token expired / refresh failed: {e}") from e
+        except AuthError:
+            raise
+        except Exception:
+            pass
 
     creds = _entry_to_creds(account_id, entry)
     if creds.expired:
         if creds.refresh_token:
             try:
-                from oidc_auth import refresh_and_persist
+                from oidc_auth import RefreshRevokedError, refresh_and_persist
 
                 r = refresh_and_persist(account_id, entry)
                 return _entry_to_creds(r["account_id"], r["entry"])
+            except RefreshRevokedError as e:
+                try:
+                    from oidc_auth import delete_account_for_refresh_failure
+
+                    delete_account_for_refresh_failure(account_id, reason=str(e))
+                except Exception:
+                    pass
+                raise AuthError(
+                    f"Account token expired / refresh permanently failed: {e}"
+                ) from e
             except Exception as e:
                 raise AuthError(f"Account token expired / refresh failed: {e}") from e
+        # No RT left — permanently unusable once access expired.
+        try:
+            from oidc_auth import delete_account_for_refresh_failure
+
+            delete_account_for_refresh_failure(
+                account_id, reason="no_refresh_token_and_access_expired"
+            )
+        except Exception:
+            pass
         raise AuthError(f"Account token expired: {account_id}")
     return creds
 

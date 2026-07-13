@@ -95,10 +95,14 @@ class YesCaptchaSolver:
         if self._debug:
             print(f"  [YesCaptcha] {msg}")
         if self._on_progress:
+            # Do NOT swallow BaseException-like control flow from callers.
+            # Registration cancel raises a custom exception from on_progress so
+            # stop can interrupt captcha polling instead of waiting full timeout.
             try:
                 self._on_progress(msg)
             except Exception:
-                pass
+                # Re-raise: cooperative cancel / hard abort must not be muted.
+                raise
 
     def _post_json(self, path: str, payload: dict, *, timeout: float = 30.0) -> dict:
         url = f"{self._endpoint}{path}"
@@ -179,11 +183,26 @@ class YesCaptchaSolver:
                 # YesCaptcha may omit status or use idle while queuing
                 elapsed = int(time.time() - started)
                 if status != last_status or elapsed % 9 < self._poll_interval:
+                    # Progress callback may raise cancel from registration worker.
                     self._progress(
                         f"still processing ({elapsed}s/{int(self._timeout)}s)..."
                     )
                 last_status = status or "processing"
-                time.sleep(self._poll_interval)
+                # Sleep in short slices so cancel via on_progress is responsive.
+                slept = 0.0
+                interval = max(0.2, float(self._poll_interval or 2.0))
+                while slept < interval:
+                    # Emit lightweight progress ticks so cancel can land mid-wait.
+                    if slept > 0:
+                        try:
+                            self._progress(
+                                f"waiting poll slice {slept:.1f}/{interval:.1f}s..."
+                            )
+                        except Exception:
+                            raise
+                    step = min(0.25, interval - slept)
+                    time.sleep(step)
+                    slept += step
                 continue
             raise RuntimeError(f"YesCaptcha unexpected status: {status} body={data}")
 

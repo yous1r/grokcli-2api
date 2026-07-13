@@ -477,16 +477,79 @@ def get_account_pool_state() -> dict[str, Any]:
     if pg is not None:
         try:
             state = pg.get_account_pool_state()
-            # Keep mem cache aligned, but never treat file JSON as authority.
-            with _lock:
-                data = _load()
-                data["account_pool"] = state
+            # Fast path: do NOT rewrite the whole settings JSON on every request.
+            # PG already caches briefly; mutating local settings.json here made
+            # every acquire() take a file lock and hurt TTFT under load.
             return dict(state) if isinstance(state, dict) else {}
         except Exception:
             pass
     data = _load()
     pool = data.get("account_pool") or {}
     return dict(pool) if isinstance(pool, dict) else {}
+
+
+def get_account_pool_meta(account_id: str) -> dict[str, Any]:
+    """Load durable pool meta for one account without full-pool scan when possible.
+
+    Sticky multi-turn TTFT path uses this so a single affinity hit does not
+    re-read all 1k+ account_pool rows.
+    """
+    if not account_id:
+        return {}
+    aid = str(account_id).strip()
+    if not aid:
+        return {}
+    pg = _pg_settings()
+    if pg is not None:
+        try:
+            if hasattr(pg, "get_pool_meta"):
+                meta = pg.get_pool_meta(aid)
+                return dict(meta) if isinstance(meta, dict) else {}
+            # Older backends: fall back to many-ids helper if present.
+            if hasattr(pg, "get_pool_meta_many"):
+                m = pg.get_pool_meta_many([aid]).get(aid)
+                return dict(m) if isinstance(m, dict) else {}
+        except Exception:
+            pass
+    state = get_account_pool_state()
+    meta = state.get(aid) if isinstance(state, dict) else None
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def get_account_pool_meta_many(account_ids: list[str]) -> dict[str, Any]:
+    """Batch durable pool meta for a candidate window (cold-path TTFT)."""
+    ids = [str(x).strip() for x in (account_ids or []) if str(x).strip()]
+    if not ids:
+        return {}
+    pg = _pg_settings()
+    if pg is not None:
+        try:
+            if hasattr(pg, "get_pool_meta_many"):
+                out = pg.get_pool_meta_many(ids)
+                return dict(out) if isinstance(out, dict) else {}
+        except Exception:
+            pass
+    state = get_account_pool_state()
+    if not isinstance(state, dict):
+        return {}
+    return {
+        aid: dict(state[aid])
+        for aid in ids
+        if isinstance(state.get(aid), dict)
+    }
+
+
+def get_cached_account_pool_state() -> dict[str, Any] | None:
+    """Warm pool-state only; None when cache is cold (never rebuilds)."""
+    pg = _pg_settings()
+    if pg is not None:
+        try:
+            if hasattr(pg, "get_cached_account_pool_state"):
+                cached = pg.get_cached_account_pool_state()
+                return dict(cached) if isinstance(cached, dict) else None
+        except Exception:
+            return None
+    return None
 
 
 # Account rotation status fields that must hit PostgreSQL/file on every change.
@@ -1195,9 +1258,19 @@ def apply_runtime_settings_to_modules() -> None:
 # ── protocol registration config (MoeMail / YesCaptcha / proxy) ────────────
 
 _REG_CONFIG_KEYS = (
+    "mail_provider",
     "base_url",
+    # Active key (derived from selected provider). Kept for adapter/env compat.
     "api_key",
+    # Per-provider secrets — all persist in DB so switching provider keeps keys.
+    "moemail_api_key",
+    "yyds_api_key",
+    "gptmail_api_key",
+    # Active domain + per-provider domains (same pattern as keys).
     "domain",
+    "moemail_domain",
+    "yyds_domain",
+    "gptmail_domain",
     "prefix",
     "expiry_ms",
     "captcha_provider",
@@ -1212,8 +1285,27 @@ _REG_CONFIG_KEYS = (
 )
 
 _REG_SECRET_KEYS = frozenset(
-    {"api_key", "yescaptcha_key", "proxy_password"}
+    {
+        "api_key",
+        "moemail_api_key",
+        "yyds_api_key",
+        "gptmail_api_key",
+        "yescaptcha_key",
+        "proxy_password",
+    }
 )
+
+_MAIL_PROVIDER_KEY_FIELDS = {
+    "moemail": "moemail_api_key",
+    "yyds": "yyds_api_key",
+    "gptmail": "gptmail_api_key",
+}
+
+_MAIL_PROVIDER_DOMAIN_FIELDS = {
+    "moemail": "moemail_domain",
+    "yyds": "yyds_domain",
+    "gptmail": "gptmail_domain",
+}
 
 
 def _mask_secret(value: str | None) -> str:
@@ -1242,17 +1334,65 @@ def _env_registration_defaults() -> dict[str, Any]:
         if MOEMAIL_BASE_URL:
             out["base_url"] = str(MOEMAIL_BASE_URL)
         if MOEMAIL_DOMAIN:
-            out["domain"] = str(MOEMAIL_DOMAIN)
+            # Env domain only seeds MoeMail — never bleed into YYDS/GPTMail.
+            out["moemail_domain"] = str(MOEMAIL_DOMAIN)
         if MOEMAIL_EXPIRY_MS is not None:
             out["expiry_ms"] = int(MOEMAIL_EXPIRY_MS)
         if MOEMAIL_API_KEY:
+            # Legacy single-key env still seeds the active + moemail slot.
             out["api_key"] = str(MOEMAIL_API_KEY)
+            out["moemail_api_key"] = str(MOEMAIL_API_KEY)
+        # Optional dedicated env overrides for other providers.
+        yyds_key = (
+            os.environ.get("GROK2API_YYDS_API_KEY")
+            or os.environ.get("YYDS_API_KEY")
+            or ""
+        ).strip()
+        if yyds_key:
+            out["yyds_api_key"] = yyds_key
+        gpt_key = (
+            os.environ.get("GROK2API_GPTMAIL_API_KEY")
+            or os.environ.get("GPTMAIL_API_KEY")
+            or ""
+        ).strip()
+        if gpt_key:
+            out["gptmail_api_key"] = gpt_key
+        yyds_dom = (
+            os.environ.get("GROK2API_YYDS_DOMAIN")
+            or os.environ.get("YYDS_DOMAIN")
+            or ""
+        ).strip().lstrip("@").strip(".")
+        if yyds_dom:
+            out["yyds_domain"] = yyds_dom
+        gpt_dom = (
+            os.environ.get("GROK2API_GPTMAIL_DOMAIN")
+            or os.environ.get("GPTMAIL_DOMAIN")
+            or ""
+        ).strip().lstrip("@").strip(".")
+        if gpt_dom:
+            out["gptmail_domain"] = gpt_dom
         if XAI_PROXY:
             out["proxy"] = str(XAI_PROXY)
         if XAI_PROXY_USERNAME:
             out["proxy_username"] = str(XAI_PROXY_USERNAME)
         if XAI_PROXY_PASSWORD:
             out["proxy_password"] = str(XAI_PROXY_PASSWORD)
+        mail_provider = (
+            os.environ.get("GROK2API_MAIL_PROVIDER")
+            or os.environ.get("MAIL_PROVIDER")
+            or ""
+        ).strip().lower()
+        if mail_provider:
+            out["mail_provider"] = mail_provider
+        elif MOEMAIL_BASE_URL:
+            try:
+                from moemail import normalize_mail_provider
+
+                out["mail_provider"] = normalize_mail_provider(
+                    None, base_url=str(MOEMAIL_BASE_URL)
+                )
+            except Exception:
+                out["mail_provider"] = "moemail"
     except Exception:
         pass
     yes = (
@@ -1291,17 +1431,114 @@ def _normalize_registration_config(
     src = raw if isinstance(raw, dict) else {}
     env = _env_registration_defaults() if merge_env else {}
 
-    def _pick_str(key: str, max_len: int = 512) -> str:
-        val = src.get(key)
-        if val is None or str(val).strip() == "":
-            val = env.get(key, "")
-        s = str(val or "").strip()
-        return s[:max_len]
+    def _pick_str(key: str, max_len: int = 512, *, allow_env: bool = True) -> str:
+        # Prefer explicit source values, including empty string (means cleared).
+        if key in src and src.get(key) is not None:
+            s = str(src.get(key) or "").strip()
+            return s[:max_len]
+        if allow_env:
+            s = str(env.get(key, "") or "").strip()
+            return s[:max_len]
+        return ""
+
+    def _pick_domain(key: str) -> str:
+        # Domain slots: empty string is a real value (auto domain). Only fall
+        # back to env when the key is completely absent from src.
+        if key in src:
+            return str(src.get(key) or "").strip().lstrip("@").strip(".")[:128]
+        return str(env.get(key, "") or "").strip().lstrip("@").strip(".")[:128]
 
     cfg["base_url"] = _pick_str("base_url", 256)
-    cfg["api_key"] = _pick_str("api_key", 512)
-    cfg["domain"] = _pick_str("domain", 128).lstrip("@").strip(".")
+    legacy_api_key = _pick_str("api_key", 512)
+    cfg["moemail_api_key"] = _pick_str("moemail_api_key", 512)
+    cfg["yyds_api_key"] = _pick_str("yyds_api_key", 512)
+    cfg["gptmail_api_key"] = _pick_str("gptmail_api_key", 512)
+    # Do NOT env-fill legacy domain into every provider — only use explicit src.
+    if "domain" in src:
+        legacy_domain = str(src.get("domain") or "").strip().lstrip("@").strip(".")[:128]
+    else:
+        legacy_domain = ""
+    cfg["moemail_domain"] = _pick_domain("moemail_domain")
+    cfg["yyds_domain"] = _pick_domain("yyds_domain")
+    cfg["gptmail_domain"] = _pick_domain("gptmail_domain")
     cfg["prefix"] = _pick_str("prefix", 64)
+    try:
+        from moemail import (
+            normalize_gptmail_base_url,
+            normalize_mail_provider,
+            normalize_yyds_base_url,
+        )
+    except Exception:
+        normalize_mail_provider = None  # type: ignore[assignment]
+        normalize_yyds_base_url = None  # type: ignore[assignment]
+        normalize_gptmail_base_url = None  # type: ignore[assignment]
+
+    mail_raw = _pick_str("mail_provider", 32).lower()
+    if normalize_mail_provider is not None:
+        cfg["mail_provider"] = normalize_mail_provider(
+            mail_raw or None, base_url=cfg["base_url"]
+        )
+    else:
+        if mail_raw in {"yyds", "yydsmail"}:
+            cfg["mail_provider"] = "yyds"
+        elif mail_raw in {"gptmail", "gpt-mail", "chatgptmail"}:
+            cfg["mail_provider"] = "gptmail"
+        else:
+            cfg["mail_provider"] = (
+                mail_raw if mail_raw in {"moemail", "yyds", "gptmail"} else "moemail"
+            )
+
+    # Migrate legacy single api_key into the selected provider slot when empty.
+    if legacy_api_key:
+        slot = _MAIL_PROVIDER_KEY_FIELDS.get(cfg["mail_provider"], "moemail_api_key")
+        if not cfg.get(slot):
+            cfg[slot] = legacy_api_key
+        # Also seed moemail if nothing else was stored yet (oldest installs).
+        if not cfg.get("moemail_api_key") and cfg["mail_provider"] == "moemail":
+            cfg["moemail_api_key"] = legacy_api_key
+
+    # Migrate legacy single domain into the selected provider slot when empty.
+    # Only when the active provider slot is absent/empty AND legacy domain was
+    # explicitly provided for that same save — never copy env domain across.
+    if legacy_domain:
+        dslot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(
+            cfg["mail_provider"], "moemail_domain"
+        )
+        if dslot not in src or not str(src.get(dslot) or "").strip():
+            if not cfg.get(dslot):
+                cfg[dslot] = legacy_domain
+        if cfg["mail_provider"] == "moemail" and not cfg.get("moemail_domain"):
+            cfg["moemail_domain"] = legacy_domain
+
+    # Active key always mirrors the selected provider (adapter reads api_key).
+    active_slot = _MAIL_PROVIDER_KEY_FIELDS.get(
+        cfg["mail_provider"], "moemail_api_key"
+    )
+    cfg["api_key"] = str(cfg.get(active_slot) or "").strip()
+
+    # Active domain mirrors the selected provider (adapter reads domain).
+    active_dom_slot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(
+        cfg["mail_provider"], "moemail_domain"
+    )
+    cfg["domain"] = str(cfg.get(active_dom_slot) or "").strip().lstrip("@").strip(".")
+
+    # YYDS / GPTMail use fixed official hosts — no user URL required.
+    if cfg["mail_provider"] == "yyds":
+        cfg["base_url"] = (
+            normalize_yyds_base_url(None)
+            if normalize_yyds_base_url is not None
+            else "https://maliapi.215.im"
+        )
+    elif cfg["mail_provider"] == "gptmail":
+        cfg["base_url"] = (
+            normalize_gptmail_base_url(None)
+            if normalize_gptmail_base_url is not None
+            else "https://mail.chatgpt.org.uk"
+        )
+    else:
+        # MoeMail: keep user base_url (self-hosted).
+        pass
+
     provider_raw = _pick_str("captcha_provider", 32).lower()
     if provider_raw not in {"local", "yescaptcha"}:
         # Prefer local when a local solver URL is configured; otherwise YesCaptcha.
@@ -1323,7 +1560,7 @@ def _normalize_registration_config(
     cfg["proxy_username"] = _pick_str("proxy_username", 256)
     cfg["proxy_password"] = _pick_str("proxy_password", 512)
 
-    # expiry_ms — official MoeMail presets only
+    # expiry_ms — MoeMail official presets; YYDS temp mail is ~24h (map to 1 day).
     expiry_raw = src.get("expiry_ms", env.get("expiry_ms", 3600000))
     try:
         expiry = int(expiry_raw)
@@ -1334,6 +1571,10 @@ def _normalize_registration_config(
         # nearest timed preset
         timed = (3600000, 86400000, 259200000)
         expiry = min(timed, key=lambda p: abs(p - expiry))
+    if cfg["mail_provider"] in {"yyds", "gptmail"}:
+        # YYDS / GPTMail temp inboxes auto-expire ~24h; permanent/3d not meaningful.
+        if expiry in (0, 259200000):
+            expiry = 86400000
     cfg["expiry_ms"] = expiry
 
     def _int_field(key: str, default: int, lo: int, hi: int) -> int:
@@ -1367,8 +1608,18 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
             public[k] = ""
             public[f"{k}_set"] = False
     provider = str(cfg.get("captcha_provider") or "local").strip().lower()
+    mail_provider = str(cfg.get("mail_provider") or "moemail").strip().lower()
+    has_moemail = bool(cfg.get("moemail_api_key") or (
+        cfg.get("api_key") if mail_provider == "moemail" else ""
+    ))
+    has_yyds = bool(cfg.get("yyds_api_key"))
+    has_gpt = bool(cfg.get("gptmail_api_key"))
+    has_active = bool(cfg.get("api_key"))
     public["configured"] = {
-        "moemail": bool(cfg.get("api_key")),
+        "moemail": has_moemail,
+        "yyds": has_yyds,
+        "gptmail": has_gpt,
+        "mail": has_active or has_moemail or has_yyds or has_gpt,
         "yescaptcha": bool(cfg.get("yescaptcha_key")),
         "local_solver": bool(cfg.get("local_solver_url")),
         "captcha": (
@@ -1379,7 +1630,17 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
         "proxy": bool(cfg.get("proxy")),
     }
     public["captcha_provider"] = provider
+    public["mail_provider"] = mail_provider
+    # Fixed hosts — UI should not require URL for yyds/gptmail.
+    public["mail_base_url_fixed"] = mail_provider in {"yyds", "gptmail"}
     return public
+
+
+def _is_masked_secret(value: str | None) -> bool:
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return False
+    return ("…" in s) or s == "****" or set(s) <= {"*"}
 
 
 def set_registration_config(
@@ -1389,8 +1650,14 @@ def set_registration_config(
 ) -> dict[str, Any]:
     """Persist registration config to DB/settings and apply to runtime.
 
-    Secret fields that arrive empty / masked keep the previously stored value
-    so the admin form can re-save non-secret edits without re-typing keys.
+    Secrets:
+      - masked placeholder → keep previous
+      - empty string on the *active* provider key → clear (user deleted + saved)
+      - empty string on inactive provider keys → keep previous
+      - non-empty → overwrite
+    Domains:
+      - empty on active provider → clear and keep empty in DB
+      - empty on inactive provider slots → keep previous
     """
     if patch is not None and not isinstance(patch, dict):
         raise ValueError("registration_config must be an object")
@@ -1405,38 +1672,133 @@ def set_registration_config(
     else:
         base = dict(current_stored)
 
+    # Resolve selected provider early so we can treat inactive slots carefully.
+    try:
+        from moemail import normalize_mail_provider as _nmp
+
+        prov = _nmp(
+            str(
+                patch.get("mail_provider")
+                or base.get("mail_provider")
+                or current_stored.get("mail_provider")
+                or "moemail"
+            ),
+            base_url=str(patch.get("base_url") or base.get("base_url") or ""),
+        )
+    except Exception:
+        prov = str(
+            patch.get("mail_provider") or base.get("mail_provider") or "moemail"
+        ).strip().lower() or "moemail"
+    active_key_slot = _MAIL_PROVIDER_KEY_FIELDS.get(prov, "moemail_api_key")
+    active_dom_slot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(prov, "moemail_domain")
+
     for key in _REG_CONFIG_KEYS:
         if key not in patch:
             continue
         val = patch.get(key)
         if key in _REG_SECRET_KEYS:
             s = "" if val is None else str(val).strip()
-            # Keep previous secret when UI sends blank or already-masked value
-            if not s or "…" in s or s == "****" or set(s) <= {"*"}:
+            # Masked UI value → keep previous secret.
+            if _is_masked_secret(s):
                 if key in current_stored and current_stored.get(key):
                     base[key] = current_stored[key]
+                continue
+            # Empty secret:
+            # - active provider key / active api_key → clear (user deleted + saved)
+            # - inactive provider keys → keep previous (field not shown/edited)
+            if not s:
+                is_active_secret = key in {"api_key", active_key_slot}
+                if is_active_secret:
+                    base[key] = ""
+                elif key in current_stored and current_stored.get(key):
+                    base[key] = current_stored[key]
+                else:
+                    base[key] = ""
                 continue
             base[key] = s
             continue
         if val is None:
             base.pop(key, None)
             continue
+        # Per-provider domain slots for *inactive* providers: empty string means
+        # "not edited this save", keep previous DB value (don't wipe).
+        if (
+            key in _MAIL_PROVIDER_DOMAIN_FIELDS.values()
+            and key != active_dom_slot
+            and isinstance(val, str)
+            and not val.strip()
+        ):
+            if key in current_stored:
+                base[key] = current_stored[key]
+            continue
         base[key] = val
 
+    # Mirror active api_key ↔ provider slot.
+    # Empty active key after explicit edit must clear the provider slot too.
+    if "api_key" in patch and not _is_masked_secret(patch.get("api_key")):
+        active = str(patch.get("api_key") or "").strip()
+        base["api_key"] = active
+        if active_key_slot not in patch or not str(patch.get(active_key_slot) or "").strip():
+            # UI edited the visible key field for this provider.
+            base[active_key_slot] = active
+        elif str(patch.get(active_key_slot) or "").strip():
+            base[active_key_slot] = str(patch.get(active_key_slot) or "").strip()
+    elif active_key_slot in patch and not _is_masked_secret(patch.get(active_key_slot)):
+        base[active_key_slot] = str(patch.get(active_key_slot) or "").strip()
+        base["api_key"] = base[active_key_slot]
+    else:
+        # No key edit this save — keep active key mirrored from slot.
+        base["api_key"] = str(base.get(active_key_slot) or base.get("api_key") or "").strip()
+
+    if "domain" in patch:
+        # Explicit active domain edit for the current provider.
+        # Empty string is allowed (means auto/random / cleared).
+        active_dom = str(patch.get("domain") or "").strip().lstrip("@").strip(".")
+        base["domain"] = active_dom
+        base[active_dom_slot] = active_dom
+    elif active_dom_slot in patch:
+        active_dom = str(patch.get(active_dom_slot) or "").strip().lstrip("@").strip(".")
+        base[active_dom_slot] = active_dom
+        base["domain"] = active_dom
+    else:
+        base["domain"] = str(
+            base.get(active_dom_slot) or base.get("domain") or ""
+        ).strip().lstrip("@").strip(".")
+
     cfg = _normalize_registration_config(base, merge_env=False)
-    # Drop empty optional strings to keep the row small
+    # Drop empty optional strings to keep the row small — except domains/keys:
+    # empty is a real "cleared" value and must stay in DB so env cannot revive it.
+    keep_empty = {
+        "expiry_ms",
+        "domain",
+        "moemail_domain",
+        "yyds_domain",
+        "gptmail_domain",
+        "api_key",
+        "moemail_api_key",
+        "yyds_api_key",
+        "gptmail_api_key",
+    }
     cleaned = {
         k: v
         for k, v in cfg.items()
-        if not (isinstance(v, str) and v == "" and k not in ("expiry_ms",))
+        if not (isinstance(v, str) and v == "" and k not in keep_empty)
     }
     # Always keep numeric defaults
     for k in ("expiry_ms", "count", "concurrency", "stagger_ms"):
         cleaned[k] = cfg[k]
+    # Always persist active + per-provider domain slots (including empty).
+    for k in ("domain", "moemail_domain", "yyds_domain", "gptmail_domain"):
+        cleaned[k] = str(cfg.get(k) or "").strip().lstrip("@").strip(".")
+    # Always persist active + per-provider keys (including empty after clear).
+    for k in ("api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key"):
+        cleaned[k] = str(cfg.get(k) or "").strip()
 
     _set_setting_value("registration_config", cleaned)
     apply_registration_config_to_runtime(cleaned)
-    return get_registration_config(include_secrets=True)
+    # Return the just-saved config as-is (do not re-merge env, which may still
+    # hold stale keys for a brief moment / from process env).
+    return dict(cleaned)
 
 
 def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> None:
@@ -1449,10 +1811,23 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     def _set_env(name: str, value: str) -> None:
         if value:
             os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
 
-    api_key = str(cfg.get("api_key") or "").strip()
-    base_url = str(cfg.get("base_url") or "").strip()
-    domain = str(cfg.get("domain") or "").strip()
+    mail_provider = str(cfg.get("mail_provider") or "moemail").strip().lower()
+    if mail_provider not in {"moemail", "yyds", "gptmail"}:
+        mail_provider = "moemail"
+    # Prefer per-provider key; fall back to legacy api_key.
+    slot = _MAIL_PROVIDER_KEY_FIELDS.get(mail_provider, "moemail_api_key")
+    api_key = str(cfg.get(slot) or cfg.get("api_key") or "").strip()
+    if mail_provider == "yyds":
+        base_url = "https://maliapi.215.im"
+    elif mail_provider == "gptmail":
+        base_url = "https://mail.chatgpt.org.uk"
+    else:
+        base_url = str(cfg.get("base_url") or "").strip()
+    dslot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(mail_provider, "moemail_domain")
+    domain = str(cfg.get(dslot) or cfg.get("domain") or "").strip().lstrip("@").strip(".")
     provider = str(cfg.get("captcha_provider") or "local").strip().lower()
     if provider not in {"local", "yescaptcha"}:
         provider = "local"
@@ -1463,13 +1838,24 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     proxy_user = str(cfg.get("proxy_username") or "").strip()
     proxy_pass = str(cfg.get("proxy_password") or "").strip()
 
-    if api_key:
-        _set_env("GROK2API_MOEMAIL_API_KEY", api_key)
-        _set_env("MOEMAIL_API_KEY", api_key)
+    _set_env("GROK2API_MAIL_PROVIDER", mail_provider)
+    _set_env("MAIL_PROVIDER", mail_provider)
+    # Active key used by helpers via MOEMAIL_API_KEY — clear when deleted.
+    _set_env("GROK2API_MOEMAIL_API_KEY", api_key)
+    _set_env("MOEMAIL_API_KEY", api_key)
+    # Dedicated env mirrors (clear when empty so get_registration_config
+    # cannot re-hydrate a just-deleted key from process env).
+    mkey = str(cfg.get("moemail_api_key") or "").strip()
+    ykey = str(cfg.get("yyds_api_key") or "").strip()
+    gkey = str(cfg.get("gptmail_api_key") or "").strip()
+    _set_env("GROK2API_MOEMAIL_ONLY_API_KEY", mkey)
+    _set_env("GROK2API_YYDS_API_KEY", ykey)
+    _set_env("YYDS_API_KEY", ykey)
+    _set_env("GROK2API_GPTMAIL_API_KEY", gkey)
+    _set_env("GPTMAIL_API_KEY", gkey)
     if base_url:
         _set_env("GROK2API_MOEMAIL_BASE_URL", base_url)
-    if domain:
-        _set_env("GROK2API_MOEMAIL_DOMAIN", domain)
+    _set_env("GROK2API_MOEMAIL_DOMAIN", domain)
     _set_env("GROK2API_CAPTCHA_PROVIDER", provider)
     _set_env("CAPTCHA_PROVIDER", provider)
     if provider == "local":
@@ -1514,12 +1900,13 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     try:
         import config as _cfg
 
-        if api_key:
-            _cfg.MOEMAIL_API_KEY = api_key
+        # Always mirror active key/domain, including empty clears.
+        _cfg.MOEMAIL_API_KEY = api_key
         if base_url:
             _cfg.MOEMAIL_BASE_URL = base_url
-        if domain:
-            _cfg.MOEMAIL_DOMAIN = domain
+        _cfg.MOEMAIL_DOMAIN = domain
+        if hasattr(_cfg, "MAIL_PROVIDER"):
+            _cfg.MAIL_PROVIDER = mail_provider
         if cfg.get("expiry_ms") is not None:
             try:
                 _cfg.MOEMAIL_EXPIRY_MS = int(cfg["expiry_ms"])
@@ -1540,6 +1927,8 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
 
         if hasattr(gba, "CAPTCHA_PROVIDER"):
             gba.CAPTCHA_PROVIDER = provider
+        if hasattr(gba, "MAIL_PROVIDER"):
+            gba.MAIL_PROVIDER = mail_provider
         if provider == "local":
             gba.YESCAPTCHA_KEY = "local"
             if hasattr(gba, "LOCAL_SOLVER_URL"):
