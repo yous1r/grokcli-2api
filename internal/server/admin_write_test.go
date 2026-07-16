@@ -11,7 +11,7 @@ import (
 )
 
 func TestAdminWriteRoutesGated(t *testing.T) {
-	for _, path := range []string{"/admin/api/login", "/admin/api/setup", "/admin/api/keys"} {
+	for _, path := range []string{"/admin/api/login", "/admin/api/setup", "/admin/api/keys", "/admin/api/accounts/x/kick"} {
 		rec := httptest.NewRecorder()
 		NewMux(Options{Ready: func() bool { return true }}).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
 		if rec.Code != http.StatusServiceUnavailable {

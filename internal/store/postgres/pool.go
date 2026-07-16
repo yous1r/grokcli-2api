@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -183,4 +184,218 @@ func stringValue(ptr *string, fallback string) string {
 		return *ptr
 	}
 	return fallback
+}
+
+// SetAccountEnabled toggles pool enabled flag. Re-enable clears cooldown/quota/model blocks.
+func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, enabled bool) (map[string]any, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, errors.New("account id required")
+	}
+	if err := c.ensureAccountExists(ctx, accountID); err != nil {
+		return nil, err
+	}
+	if enabled {
+		_, err := c.Pool.Exec(ctx, `
+			INSERT INTO account_pool (account_id, enabled, pool_status, extra, updated_at)
+			VALUES ($1, true, 'normal', '{}'::jsonb, now())
+			ON CONFLICT (account_id) DO UPDATE SET
+				enabled = true,
+				disabled_for_quota = false,
+				disabled_reason = NULL,
+				quota_disabled_at = NULL,
+				quota_source = NULL,
+				blocked_models = '{}'::jsonb,
+				cooldown_until = NULL,
+				cooldown_reason = NULL,
+				cooldown_code = NULL,
+				cooldown_model = NULL,
+				cooldown_tokens_actual = NULL,
+				cooldown_tokens_limit = NULL,
+				last_error = NULL,
+				pool_status = 'normal',
+				extra = jsonb_set(COALESCE(account_pool.extra, '{}'::jsonb), '{consecutive_fails}', '0'::jsonb, true),
+				updated_at = now()
+		`, accountID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		_, err := c.Pool.Exec(ctx, `
+			INSERT INTO account_pool (account_id, enabled, pool_status, extra, updated_at)
+			VALUES ($1, false, 'disabled', '{}'::jsonb, now())
+			ON CONFLICT (account_id) DO UPDATE SET
+				enabled = false,
+				pool_status = 'disabled',
+				updated_at = now()
+		`, accountID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return c.GetAccountPoolView(ctx, accountID)
+}
+
+// ClearAccountCooldown clears durable cooldown so the account re-enters rotation.
+func (c *Connector) ClearAccountCooldown(ctx context.Context, accountID string) (map[string]any, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, errors.New("account id required")
+	}
+	if err := c.ensureAccountExists(ctx, accountID); err != nil {
+		return nil, err
+	}
+	_, err := c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, pool_status, extra, updated_at)
+		VALUES ($1, 'normal', '{}'::jsonb, now())
+		ON CONFLICT (account_id) DO UPDATE SET
+			cooldown_until = NULL,
+			cooldown_reason = NULL,
+			cooldown_code = NULL,
+			cooldown_model = NULL,
+			cooldown_tokens_actual = NULL,
+			cooldown_tokens_limit = NULL,
+			last_error = NULL,
+			pool_status = CASE
+				WHEN account_pool.enabled = false OR account_pool.disabled_for_quota = true THEN 'disabled'
+				ELSE 'normal'
+			END,
+			updated_at = now()
+	`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	return c.GetAccountPoolView(ctx, accountID)
+}
+
+// KickFromPool temporarily cools down or hard-disables an account.
+// cooldownSec > 0: temporary cooldown; otherwise enabled=false.
+func (c *Connector) KickFromPool(ctx context.Context, accountID, reason string, cooldownSec *float64) (map[string]any, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, errors.New("account id required")
+	}
+	if err := c.ensureAccountExists(ctx, accountID); err != nil {
+		return nil, err
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "手动移出轮询"
+	}
+	if len(reason) > 300 {
+		reason = reason[:300]
+	}
+	if cooldownSec != nil && *cooldownSec > 0 {
+		// stack cooldown count when possible
+		var prevCount int64
+		_ = c.Pool.QueryRow(ctx, `SELECT COALESCE(cooldown_count, 0) FROM account_pool WHERE account_id = $1`, accountID).Scan(&prevCount)
+		newCount := prevCount + 1
+		if newCount < 1 {
+			newCount = 1
+		}
+		until := time.Now().Add(time.Duration(maxFloat(*cooldownSec, 60)*float64(newCount)) * time.Second)
+		_, err := c.Pool.Exec(ctx, `
+			INSERT INTO account_pool (account_id, enabled, pool_status, cooldown_until, cooldown_reason, cooldown_count, last_error, extra, updated_at)
+			VALUES ($1, true, 'cooldown', $2, $3, $4::int, $3, jsonb_build_object('cooldown_count', $4::int), now())
+			ON CONFLICT (account_id) DO UPDATE SET
+				pool_status = 'cooldown',
+				cooldown_until = EXCLUDED.cooldown_until,
+				cooldown_reason = EXCLUDED.cooldown_reason,
+				cooldown_count = EXCLUDED.cooldown_count,
+				last_error = EXCLUDED.last_error,
+				extra = COALESCE(account_pool.extra, '{}'::jsonb) || jsonb_build_object('cooldown_count', EXCLUDED.cooldown_count),
+				updated_at = now()
+		`, accountID, until, reason, int(newCount))
+		if err != nil {
+			return nil, err
+		}
+		return c.GetAccountPoolView(ctx, accountID)
+	}
+	return c.SetAccountEnabled(ctx, accountID, false)
+}
+
+func (c *Connector) ensureAccountExists(ctx context.Context, accountID string) error {
+	var exists bool
+	if err := c.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)`, accountID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return errAccountNotFound
+	}
+	return nil
+}
+
+var errAccountNotFound = errors.New("account not found")
+
+func IsAccountNotFound(err error) bool {
+	return err != nil && (err == errAccountNotFound || strings.Contains(err.Error(), "account not found"))
+}
+
+func (c *Connector) GetAccountPoolView(ctx context.Context, accountID string) (map[string]any, error) {
+	accountID = strings.TrimSpace(accountID)
+	row := c.Pool.QueryRow(ctx, `
+		SELECT a.id, a.email, a.user_id, a.team_id, a.expires_at, a.updated_at,
+		       COALESCE(ap.enabled, true), COALESCE(ap.weight, 1), COALESCE(ap.request_count, 0),
+		       COALESCE(ap.success_count, 0), COALESCE(ap.fail_count, 0), ap.last_used_at, ap.last_error,
+		       ap.cooldown_until, COALESCE(ap.disabled_for_quota, false), ap.disabled_reason,
+		       ap.quota_disabled_at, COALESCE(ap.pool_status, 'normal'), COALESCE(ap.cooldown_count, 0),
+		       COALESCE(ap.blocked_models, '{}'::jsonb)
+		FROM accounts a
+		LEFT JOIN account_pool ap ON ap.account_id = a.id
+		WHERE a.id = $1
+	`, accountID)
+	var id string
+	var email, userID, teamID, lastError, disabledReason, poolStatus *string
+	var expiresAt, updatedAt, lastUsedAt, cooldownUntil, quotaDisabledAt *time.Time
+	var enabled, disabledForQuota bool
+	var weight, requestCount, successCount, failCount, cooldownCount int64
+	var blockedBytes []byte
+	if err := row.Scan(&id, &email, &userID, &teamID, &expiresAt, &updatedAt, &enabled, &weight, &requestCount, &successCount, &failCount, &lastUsedAt, &lastError, &cooldownUntil, &disabledForQuota, &disabledReason, &quotaDisabledAt, &poolStatus, &cooldownCount, &blockedBytes); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	inCooldown := cooldownUntil != nil && cooldownUntil.After(now)
+	status := "normal"
+	if poolStatus != nil && strings.TrimSpace(*poolStatus) != "" {
+		status = strings.TrimSpace(*poolStatus)
+	}
+	if !enabled || disabledForQuota {
+		status = "disabled"
+	} else if inCooldown {
+		status = "cooldown"
+	}
+	blocked := decodeMap(blockedBytes)
+	out := map[string]any{
+		"id":                     id,
+		"email":                  stringPtr(email),
+		"user_id":                stringPtr(userID),
+		"team_id":                stringPtr(teamID),
+		"enabled":                enabled,
+		"weight":                 weight,
+		"request_count":          requestCount,
+		"success_count":          successCount,
+		"fail_count":             failCount,
+		"last_used_at":           unixOrNil(lastUsedAt),
+		"last_error":             stringPtr(lastError),
+		"cooldown_until":         unixOrNil(cooldownUntil),
+		"cooldown_remaining_sec": cooldownRemaining(now, cooldownUntil),
+		"in_cooldown":            inCooldown,
+		"disabled_for_quota":     disabledForQuota,
+		"disabled_reason":        stringPtr(disabledReason),
+		"quota_disabled_at":      unixOrNil(quotaDisabledAt),
+		"pool_status":            status,
+		"cooldown_count":         cooldownCount,
+		"blocked_models":         blocked,
+		"blocked_model_ids":      mapKeys(blocked),
+		"expires_at":             unixOrNil(expiresAt),
+		"updated_at":             unixOrNil(updatedAt),
+	}
+	return out, nil
+}
+
+func maxFloat(v, min float64) float64 {
+	if v < min {
+		return min
+	}
+	return v
 }

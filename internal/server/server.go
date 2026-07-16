@@ -226,6 +226,15 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("DELETE /admin/api/keys/{key_id}", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminDeleteKey(w, r, options)
 	})
+	mux.HandleFunc("PATCH /admin/api/accounts/{account_id}/enabled", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminSetAccountEnabled(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/{account_id}/kick", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminKickAccount(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/{account_id}/cooldown/clear", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminClearCooldown(w, r, options)
+	})
 	return mux
 }
 
@@ -1702,6 +1711,88 @@ func publicAPIBase(r *http.Request, port int) string {
 		}
 	}
 	return proto + "://" + host + "/v1"
+}
+
+func serveAdminSetAccountEnabled(w http.ResponseWriter, r *http.Request, options Options) {
+	if !adminWriteAllowed(w, r, options) {
+		return
+	}
+	if _, ok := admin.RequireSession(r, options.AdminSessions); !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	enabled, ok := body["enabled"].(bool)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "enabled bool required"})
+		return
+	}
+	rec, err := options.Store.SetAccountEnabled(r.Context(), r.PathValue("account_id"), enabled)
+	if err != nil {
+		if postgres.IsAccountNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Account not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": rec})
+}
+
+func serveAdminKickAccount(w http.ResponseWriter, r *http.Request, options Options) {
+	if !adminWriteAllowed(w, r, options) {
+		return
+	}
+	if _, ok := admin.RequireSession(r, options.AdminSessions); !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	reason := stringValue(body["reason"])
+	var cooldown *float64
+	switch v := body["cooldown_sec"].(type) {
+	case float64:
+		cooldown = &v
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			cooldown = &f
+		}
+	}
+	rec, err := options.Store.KickFromPool(r.Context(), r.PathValue("account_id"), reason, cooldown)
+	if err != nil {
+		if postgres.IsAccountNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": rec})
+}
+
+func serveAdminClearCooldown(w http.ResponseWriter, r *http.Request, options Options) {
+	if !adminWriteAllowed(w, r, options) {
+		return
+	}
+	if _, ok := admin.RequireSession(r, options.AdminSessions); !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
+		return
+	}
+	rec, err := options.Store.ClearAccountCooldown(r.Context(), r.PathValue("account_id"))
+	if err != nil {
+		if postgres.IsAccountNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": rec})
 }
 
 func adminWriteAllowed(w http.ResponseWriter, r *http.Request, options Options) bool {
