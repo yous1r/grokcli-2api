@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -281,4 +282,764 @@ func mapKeys(value map[string]any) []string {
 
 func itoaSQL(value int) string {
 	return strconv.Itoa(value)
+}
+
+type AccountAuth struct {
+	ID    string
+	Email string
+	Token string
+}
+
+func (c *Connector) GetAccountAuth(ctx context.Context, accountID string) (*AccountAuth, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, errors.New("account id required")
+	}
+	row := c.Pool.QueryRow(ctx, `SELECT id, email, payload FROM accounts WHERE id = $1`, accountID)
+	var id string
+	var email *string
+	var payloadBytes []byte
+	if err := row.Scan(&id, &email, &payloadBytes); err != nil {
+		return nil, err
+	}
+	payload := decodeMap(payloadBytes)
+	token, _ := firstString(payload, "key", "access_token", "token")
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("account has no access token")
+	}
+	out := &AccountAuth{ID: id, Token: token}
+	if email != nil {
+		out.Email = *email
+	} else {
+		out.Email = stringFromMap(payload, "email")
+	}
+	return out, nil
+}
+
+// DeleteAccount removes one account and its pool row from PostgreSQL.
+func (c *Connector) DeleteAccount(ctx context.Context, accountID string) (bool, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return false, errors.New("account id required")
+	}
+	tag, err := c.Pool.Exec(ctx, `DELETE FROM accounts WHERE id = $1`, accountID)
+	if err != nil {
+		return false, err
+	}
+	_, _ = c.Pool.Exec(ctx, `DELETE FROM account_pool WHERE account_id = $1`, accountID)
+	return tag.RowsAffected() > 0, nil
+}
+
+// DeleteAccounts removes many accounts in one transaction.
+func (c *Connector) DeleteAccounts(ctx context.Context, accountIDs []string) (map[string]any, error) {
+	seen := map[string]struct{}{}
+	ids := make([]string, 0, len(accountIDs))
+	for _, raw := range accountIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return map[string]any{
+			"removed":       []string{},
+			"missing":       []string{},
+			"removed_count": 0,
+			"missing_count": 0,
+			"requested":     0,
+		}, nil
+	}
+
+	tx, err := c.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	removed := make([]string, 0, len(ids))
+	missing := make([]string, 0)
+	for _, id := range ids {
+		tag, err := tx.Exec(ctx, `DELETE FROM accounts WHERE id = $1`, id)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() > 0 {
+			removed = append(removed, id)
+			_, _ = tx.Exec(ctx, `DELETE FROM account_pool WHERE account_id = $1`, id)
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"removed":       removed,
+		"missing":       missing,
+		"removed_count": len(removed),
+		"missing_count": len(missing),
+		"requested":     len(ids),
+	}, nil
+}
+
+// ClearAllAccounts wipes every account + pool row.
+func (c *Connector) ClearAllAccounts(ctx context.Context) (int64, error) {
+	tx, err := c.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `DELETE FROM accounts`)
+	if err != nil {
+		return 0, err
+	}
+	_, _ = tx.Exec(ctx, `DELETE FROM account_pool`)
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// UpsertAccount writes one account payload and ensures a pool row exists.
+func (c *Connector) UpsertAccount(ctx context.Context, accountID string, entry map[string]any) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" || entry == nil {
+		return errors.New("account id and entry required")
+	}
+	// Preserve durable metadata from an existing row.
+	var oldBytes []byte
+	_ = c.Pool.QueryRow(ctx, `SELECT payload FROM accounts WHERE id = $1`, accountID).Scan(&oldBytes)
+	if len(oldBytes) > 0 {
+		entry = mergeDurableLocal(entry, decodeMap(oldBytes))
+	} else {
+		entry = mergeDurableLocal(entry, nil)
+	}
+
+	email := stringFromMap(entry, "email")
+	userID := firstMapString(entry, "user_id", "principal_id")
+	teamID := stringFromMap(entry, "team_id")
+	var expires any
+	if exp, ok := entry["expires_at"]; ok && exp != nil {
+		switch v := exp.(type) {
+		case float64:
+			expires = time.Unix(int64(v), 0).UTC()
+		case int64:
+			expires = time.Unix(v, 0).UTC()
+		case int:
+			expires = time.Unix(int64(v), 0).UTC()
+		case json.Number:
+			if f, err := v.Float64(); err == nil {
+				expires = time.Unix(int64(f), 0).UTC()
+			}
+		case string:
+			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+				expires = time.Unix(int64(f), 0).UTC()
+			} else if t, err := time.Parse(time.RFC3339, strings.TrimSpace(v)); err == nil {
+				expires = t.UTC()
+			}
+		}
+	}
+	payloadBytes, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	_, err = c.Pool.Exec(ctx, `
+		INSERT INTO accounts (id, email, user_id, team_id, payload, expires_at, updated_at)
+		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), $5::jsonb, $6, now())
+		ON CONFLICT (id) DO UPDATE SET
+			email = EXCLUDED.email,
+			user_id = EXCLUDED.user_id,
+			team_id = EXCLUDED.team_id,
+			payload = EXCLUDED.payload,
+			expires_at = EXCLUDED.expires_at,
+			updated_at = now()
+	`, accountID, email, userID, teamID, payloadBytes, expires)
+	if err != nil {
+		return err
+	}
+	_, err = c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (
+			account_id, enabled, weight, disabled_for_quota, blocked_models,
+			request_count, success_count, fail_count, extra, updated_at,
+			pool_status, cooldown_count
+		) VALUES (
+			$1, true, 1, false, '{}'::jsonb,
+			0, 0, 0, '{}'::jsonb, now(),
+			'normal', 0
+		)
+		ON CONFLICT (account_id) DO NOTHING
+	`, accountID)
+	return err
+}
+
+// ImportNormalizedAccounts merges or replaces accounts from a normalized map.
+// When merge=true, same-user collisions are removed and durable fields preserved.
+func (c *Connector) ImportNormalizedAccounts(ctx context.Context, normalized map[string]map[string]any, merge bool) (map[string]any, error) {
+	if len(normalized) == 0 {
+		total, _ := c.CountAccounts(ctx)
+		return map[string]any{
+			"ok":             false,
+			"error":          "no valid account entries found",
+			"imported":       []any{},
+			"total_accounts": total,
+		}, nil
+	}
+
+	tx, err := c.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if !merge {
+		if _, err := tx.Exec(ctx, `DELETE FROM accounts`); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM account_pool`); err != nil {
+			return nil, err
+		}
+	}
+
+	imported := make([]map[string]any, 0, len(normalized))
+	for aid, entry := range normalized {
+		entry = cloneMapAny(entry)
+		// same-user dedupe when merging
+		if merge {
+			uid := firstMapString(entry, "user_id", "principal_id")
+			token, _ := firstString(entry, "key", "access_token", "token")
+			if uid != "" || token != "" {
+				// preserve durable fields from colliding rows
+				rows, qerr := tx.Query(ctx, `
+					SELECT id, payload FROM accounts
+					WHERE id = $1
+					   OR ($2 <> '' AND (user_id = $2 OR payload->>'user_id' = $2 OR payload->>'principal_id' = $2))
+					   OR ($3 <> '' AND payload->>'key' = $3)
+				`, aid, uid, token)
+				if qerr == nil {
+					for rows.Next() {
+						var oldID string
+						var oldBytes []byte
+						if rows.Scan(&oldID, &oldBytes) == nil {
+							entry = mergeDurableLocal(entry, decodeMap(oldBytes))
+						}
+					}
+					rows.Close()
+				}
+				if uid != "" && token != "" {
+					_, _ = tx.Exec(ctx, `
+						DELETE FROM accounts
+						WHERE id <> $1 AND (
+							user_id = $2 OR payload->>'user_id' = $2 OR payload->>'principal_id' = $2 OR payload->>'key' = $3
+						)
+					`, aid, uid, token)
+				} else if uid != "" {
+					_, _ = tx.Exec(ctx, `
+						DELETE FROM accounts
+						WHERE id <> $1 AND (user_id = $2 OR payload->>'user_id' = $2 OR payload->>'principal_id' = $2)
+					`, aid, uid)
+				} else if token != "" {
+					_, _ = tx.Exec(ctx, `DELETE FROM accounts WHERE id <> $1 AND payload->>'key' = $2`, aid, token)
+				}
+				_, _ = tx.Exec(ctx, `
+					DELETE FROM account_pool ap
+					WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = ap.account_id)
+				`)
+			} else {
+				var oldBytes []byte
+				_ = tx.QueryRow(ctx, `SELECT payload FROM accounts WHERE id = $1`, aid).Scan(&oldBytes)
+				if len(oldBytes) > 0 {
+					entry = mergeDurableLocal(entry, decodeMap(oldBytes))
+				}
+			}
+		}
+
+		email := stringFromMap(entry, "email")
+		userID := firstMapString(entry, "user_id", "principal_id")
+		teamID := stringFromMap(entry, "team_id")
+		var expires any
+		if exp, ok := entry["expires_at"]; ok && exp != nil {
+			switch v := exp.(type) {
+			case float64:
+				expires = time.Unix(int64(v), 0).UTC()
+			case int64:
+				expires = time.Unix(v, 0).UTC()
+			case int:
+				expires = time.Unix(int64(v), 0).UTC()
+			case json.Number:
+				if f, err := v.Float64(); err == nil {
+					expires = time.Unix(int64(f), 0).UTC()
+				}
+			}
+		}
+		payloadBytes, err := json.Marshal(entry)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO accounts (id, email, user_id, team_id, payload, expires_at, updated_at)
+			VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), $5::jsonb, $6, now())
+			ON CONFLICT (id) DO UPDATE SET
+				email = EXCLUDED.email,
+				user_id = EXCLUDED.user_id,
+				team_id = EXCLUDED.team_id,
+				payload = EXCLUDED.payload,
+				expires_at = EXCLUDED.expires_at,
+				updated_at = now()
+		`, aid, email, userID, teamID, payloadBytes, expires); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO account_pool (
+				account_id, enabled, weight, disabled_for_quota, blocked_models,
+				request_count, success_count, fail_count, extra, updated_at,
+				pool_status, cooldown_count
+			) VALUES (
+				$1, true, 1, false, '{}'::jsonb,
+				0, 0, 0, '{}'::jsonb, now(),
+				'normal', 0
+			)
+			ON CONFLICT (account_id) DO NOTHING
+		`, aid); err != nil {
+			return nil, err
+		}
+		imported = append(imported, map[string]any{
+			"id":                aid,
+			"email":             entry["email"],
+			"user_id":           entry["user_id"],
+			"expires_at":        entry["expires_at"],
+			"has_refresh_token": stringFromMap(entry, "refresh_token") != "",
+		})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	total, _ := c.CountAccounts(ctx)
+	return map[string]any{
+		"ok":             true,
+		"message":        "已导入 " + itoaSQL(len(imported)) + " 个账号",
+		"imported":       imported,
+		"count":          len(imported),
+		"total_accounts": total,
+		"merged":         merge,
+	}, nil
+}
+
+// ExportAuthMap returns the full durable auth map (optionally filtered).
+func (c *Connector) ExportAuthMap(ctx context.Context, accountIDs []string, includeSecrets bool) (map[string]any, error) {
+	wanted := map[string]struct{}{}
+	for _, id := range accountIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			wanted[id] = struct{}{}
+		}
+	}
+	rows, err := c.Pool.Query(ctx, `SELECT id, payload FROM accounts ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	auth := map[string]any{}
+	missing := []string{}
+	for rows.Next() {
+		var id string
+		var payloadBytes []byte
+		if err := rows.Scan(&id, &payloadBytes); err != nil {
+			return nil, err
+		}
+		if len(wanted) > 0 {
+			if _, ok := wanted[id]; !ok {
+				continue
+			}
+		}
+		payload := decodeMap(payloadBytes)
+		if !includeSecrets {
+			for _, key := range []string{"key", "access_token", "token", "refresh_token", "sso", "sso_cookie", "sso_token", "password", "register_password", "id_token"} {
+				delete(payload, key)
+			}
+		}
+		auth[id] = payload
+	}
+	if len(wanted) > 0 {
+		for id := range wanted {
+			if _, ok := auth[id]; !ok {
+				missing = append(missing, id)
+			}
+		}
+	}
+	out := map[string]any{
+		"ok":          true,
+		"auth":        auth,
+		"count":       len(auth),
+		"exported_at": float64(time.Now().Unix()),
+	}
+	if len(wanted) > 0 {
+		out["selected"] = len(wanted)
+		out["missing"] = missing
+	}
+	return out, nil
+}
+
+func mergeDurableLocal(entry, old map[string]any) map[string]any {
+	if entry == nil {
+		return map[string]any{}
+	}
+	out := cloneMapAny(entry)
+	if old == nil {
+		return out
+	}
+	durable := []string{
+		"sso", "sso_cookie", "sso_token", "session_cookies", "cookies", "cookie",
+		"set_cookie", "set-cookie", "set_cookies", "password", "register_password",
+		"registration_session_id", "registration_batch_id", "sso_backup_path",
+		"source", "id_token", "refresh_token",
+	}
+	// SSO first
+	if stringFromMap(out, "sso") == "" && stringFromMap(out, "sso_cookie") == "" {
+		if s := firstMapString(old, "sso", "sso_cookie", "sso_token"); s != "" {
+			out["sso"] = s
+			out["sso_cookie"] = s
+		}
+	}
+	for _, key := range durable {
+		if (out[key] == nil || out[key] == "") && old[key] != nil && old[key] != "" {
+			out[key] = old[key]
+		}
+	}
+	if stringFromMap(out, "password") == "" && stringFromMap(out, "register_password") != "" {
+		out["password"] = stringFromMap(out, "register_password")
+	}
+	if stringFromMap(out, "register_password") == "" && stringFromMap(out, "password") != "" {
+		out["register_password"] = stringFromMap(out, "password")
+	}
+	return out
+}
+
+func cloneMapAny(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// AccountRefreshRow is one durable account payload used by token maintainer.
+type AccountRefreshRow struct {
+	ID      string
+	Email   string
+	Payload map[string]any
+}
+
+// ListRefreshableAccounts returns accounts that have a refresh_token (or are near expiry).
+func (c *Connector) ListRefreshableAccounts(ctx context.Context, limit int) ([]AccountRefreshRow, error) {
+	if limit <= 0 {
+		limit = 40
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := c.Pool.Query(ctx, `
+		SELECT id, email, payload
+		FROM accounts
+		WHERE payload ? 'refresh_token'
+		   OR (expires_at IS NOT NULL AND expires_at <= now() + interval '1 hour')
+		ORDER BY expires_at ASC NULLS FIRST, updated_at ASC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AccountRefreshRow, 0, limit)
+	for rows.Next() {
+		var id string
+		var email *string
+		var payloadBytes []byte
+		if err := rows.Scan(&id, &email, &payloadBytes); err != nil {
+			return nil, err
+		}
+		payload := decodeMap(payloadBytes)
+		row := AccountRefreshRow{ID: id, Payload: payload}
+		if email != nil {
+			row.Email = *email
+		} else {
+			row.Email = stringFromMap(payload, "email")
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// ListAccountAuths returns access tokens for probe paths.
+func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled bool) ([]AccountAuth, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	sql := `
+		SELECT a.id, a.email, a.payload
+		FROM accounts a
+		LEFT JOIN account_pool ap ON ap.account_id = a.id
+	`
+	if onlyEnabled {
+		sql += ` WHERE COALESCE(ap.enabled, true) = true AND COALESCE(ap.disabled_for_quota, false) = false `
+	}
+	sql += ` ORDER BY a.updated_at DESC LIMIT $1`
+	rows, err := c.Pool.Query(ctx, sql, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AccountAuth, 0, limit)
+	for rows.Next() {
+		var id string
+		var email *string
+		var payloadBytes []byte
+		if err := rows.Scan(&id, &email, &payloadBytes); err != nil {
+			return nil, err
+		}
+		payload := decodeMap(payloadBytes)
+		token, _ := firstString(payload, "key", "access_token", "token")
+		if strings.TrimSpace(token) == "" {
+			continue
+		}
+		item := AccountAuth{ID: id, Token: token}
+		if email != nil {
+			item.Email = *email
+		} else {
+			item.Email = stringFromMap(payload, "email")
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// SaveLastProbe stores probe result snapshot on account_pool.
+func (c *Connector) SaveLastProbe(ctx context.Context, accountID string, probe map[string]any) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	payload, err := json.Marshal(probe)
+	if err != nil {
+		return err
+	}
+	status := "ok"
+	if ok, _ := probe["available"].(bool); !ok {
+		status = "fail"
+	}
+	_, err = c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, last_probe, last_probe_status, extra, updated_at)
+		VALUES ($1, $2::jsonb, $3, '{}'::jsonb, now())
+		ON CONFLICT (account_id) DO UPDATE SET
+			last_probe = EXCLUDED.last_probe,
+			last_probe_status = EXCLUDED.last_probe_status,
+			updated_at = now()
+	`, accountID, payload, status)
+	return err
+}
+
+// ExpireDueCooldowns clears finished cooldowns so accounts re-enter rotation.
+func (c *Connector) ExpireDueCooldowns(ctx context.Context, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	tag, err := c.Pool.Exec(ctx, `
+		UPDATE account_pool
+		SET cooldown_until = NULL,
+		    cooldown_reason = NULL,
+		    cooldown_code = NULL,
+		    cooldown_model = NULL,
+		    pool_status = CASE WHEN enabled = false OR disabled_for_quota = true THEN 'disabled' ELSE 'normal' END,
+		    updated_at = now()
+		WHERE cooldown_until IS NOT NULL AND cooldown_until <= now()
+		  AND account_id IN (
+			SELECT account_id FROM account_pool
+			WHERE cooldown_until IS NOT NULL AND cooldown_until <= now()
+			LIMIT $1
+		  )
+	`, limit)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// MarkRefreshInvalid stamps permanent refresh failure on payload.
+func (c *Connector) MarkRefreshInvalid(ctx context.Context, accountID, reason string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	if len(reason) > 300 {
+		reason = reason[:300]
+	}
+	_, err := c.Pool.Exec(ctx, `
+		UPDATE accounts
+		SET payload = COALESCE(payload, '{}'::jsonb) || jsonb_build_object(
+			'refresh_invalid', true,
+			'refresh_invalid_reason', $2::text,
+			'refresh_invalid_at', extract(epoch from now())
+		),
+		updated_at = now()
+		WHERE id = $1
+	`, accountID, reason)
+	return err
+}
+
+// PruneModelBlocks clears blocked_models map entries.
+func (c *Connector) PruneModelBlocks(ctx context.Context) (int64, error) {
+	tag, err := c.Pool.Exec(ctx, `
+		UPDATE account_pool
+		SET blocked_models = '{}'::jsonb, updated_at = now()
+		WHERE blocked_models IS NOT NULL AND blocked_models <> '{}'::jsonb
+	`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// NormalizeAccountKeys rewrites storage ids to https://auth.x.ai::{user_id} when possible.
+func (c *Connector) NormalizeAccountKeys(ctx context.Context) (map[string]any, error) {
+	rows, err := c.Pool.Query(ctx, `SELECT id, payload FROM accounts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type row struct {
+		id      string
+		payload map[string]any
+	}
+	all := []row{}
+	for rows.Next() {
+		var id string
+		var payloadBytes []byte
+		if err := rows.Scan(&id, &payloadBytes); err != nil {
+			return nil, err
+		}
+		all = append(all, row{id: id, payload: decodeMap(payloadBytes)})
+	}
+	renamed, skipped := 0, 0
+	for _, r := range all {
+		uid := firstMapString(r.payload, "user_id", "principal_id", "sub")
+		if uid == "" {
+			skipped++
+			continue
+		}
+		newID := "https://auth.x.ai::" + uid
+		if newID == r.id {
+			skipped++
+			continue
+		}
+		// upsert under new id then delete old
+		if err := c.UpsertAccount(ctx, newID, r.payload); err != nil {
+			return nil, err
+		}
+		// move pool row best-effort
+		_, _ = c.Pool.Exec(ctx, `
+			INSERT INTO account_pool (account_id, enabled, weight, disabled_for_quota, blocked_models, request_count, success_count, fail_count, extra, updated_at, pool_status, cooldown_count)
+			SELECT $2, enabled, weight, disabled_for_quota, blocked_models, request_count, success_count, fail_count, extra, now(), pool_status, cooldown_count
+			FROM account_pool WHERE account_id = $1
+			ON CONFLICT (account_id) DO NOTHING
+		`, r.id, newID)
+		_, _ = c.DeleteAccount(ctx, r.id)
+		renamed++
+	}
+	total, _ := c.CountAccounts(ctx)
+	return map[string]any{
+		"ok":      true,
+		"renamed": renamed,
+		"skipped": skipped,
+		"total":   total,
+		"message": "normalized " + itoaSQL(renamed) + " account keys",
+	}, nil
+}
+
+// ListCachedQuotas returns last_quota snapshots from account_pool.
+func (c *Connector) ListCachedQuotas(ctx context.Context) (map[string]any, error) {
+	rows, err := c.Pool.Query(ctx, `
+		SELECT a.id, a.email, a.user_id, ap.last_quota, COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false)
+		FROM accounts a
+		LEFT JOIN account_pool ap ON ap.account_id = a.id
+		WHERE ap.last_quota IS NOT NULL AND ap.last_quota <> 'null'::jsonb
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	results := []map[string]any{}
+	for rows.Next() {
+		var id string
+		var email, userID *string
+		var quotaBytes []byte
+		var enabled, disabledForQuota bool
+		if err := rows.Scan(&id, &email, &userID, &quotaBytes, &enabled, &disabledForQuota); err != nil {
+			return nil, err
+		}
+		q := decodeMap(quotaBytes)
+		if len(q) == 0 {
+			continue
+		}
+		item := map[string]any{}
+		for k, v := range q {
+			item[k] = v
+		}
+		item["account_id"] = id
+		if email != nil {
+			item["email"] = *email
+		}
+		if userID != nil {
+			item["user_id"] = *userID
+		}
+		item["cached"] = true
+		item["pool_disabled"] = disabledForQuota || !enabled
+		if item["ok"] == nil {
+			item["ok"] = item["error"] == nil || item["error"] == ""
+		}
+		results = append(results, item)
+	}
+	exhausted := 0
+	okN := 0
+	for _, r := range results {
+		if r["exhausted"] == true || r["auto_disabled"] == true {
+			exhausted++
+		}
+		if r["ok"] == true && r["exhausted"] != true {
+			okN++
+		}
+	}
+	return map[string]any{
+		"ok":              true,
+		"cached":          true,
+		"count":           len(results),
+		"ok_count":        okN,
+		"exhausted_count": exhausted,
+		"results":         results,
+	}, nil
+}
+
+// SaveQuotaSnapshot persists last_quota for an account.
+func (c *Connector) SaveQuotaSnapshot(ctx context.Context, accountID string, quota map[string]any) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	payload, err := json.Marshal(quota)
+	if err != nil {
+		return err
+	}
+	_, err = c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, last_quota, extra, updated_at)
+		VALUES ($1, $2::jsonb, '{}'::jsonb, now())
+		ON CONFLICT (account_id) DO UPDATE SET last_quota = EXCLUDED.last_quota, updated_at = now()
+	`, accountID, payload)
+	return err
 }

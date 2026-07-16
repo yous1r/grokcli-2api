@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -41,9 +42,34 @@ func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("upstream status %d: %s", e.Status, e.Body)
 }
 
+// defaultHTTPClient returns a properly configured HTTP client with connection pooling
+func defaultHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 180 * time.Second, // 增加到 3 分钟，避免大请求超时
+		Transport: &http.Transport{
+			MaxIdleConns:        200,  // 增加全局空闲连接数
+			MaxIdleConnsPerHost: 100,  // 增加每个 host 的空闲连接数，支持高并发
+			MaxConnsPerHost:     200,  // 增加每个 host 的最大连接数
+			IdleConnTimeout:     120 * time.Second, // 延长空闲连接保持时间
+			TLSHandshakeTimeout: 10 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second, // 缩短连接建立超时，快速失败
+				KeepAlive: 60 * time.Second, // 延长 TCP keepalive
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			DisableCompression:    false,
+			ExpectContinueTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second, // 添加响应头超时，避免无响应挂起
+			DisableKeepAlives:     false,
+			WriteBufferSize:       32 * 1024, // 增加写缓冲，提高大请求性能
+			ReadBufferSize:        32 * 1024, // 增加读缓冲，提高大响应性能
+		},
+	}
+}
+
 func (c *Client) Open(ctx context.Context, account Account, model string, body map[string]any) (*http.Response, error) {
 	if c.HTTP == nil {
-		c.HTTP = http.DefaultClient
+		c.HTTP = defaultHTTPClient()
 	}
 	payload := cloneMap(body)
 	payload["model"] = model

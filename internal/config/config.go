@@ -54,6 +54,10 @@ type Config struct {
 	SSEKeepalive           time.Duration
 	RequestTimeout         time.Duration
 	OutboundMaxTools       int
+	Workers                int
+	MaintainerLeader       string
+	MaintainerLeaderTTL    time.Duration
+	MaintainerLeaderRenew  time.Duration
 }
 
 func Load() (Config, error) {
@@ -130,6 +134,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	workers, err := envInt("GROK2API_WORKERS", 1, 1, 256)
+	if err != nil {
+		return Config{}, err
+	}
+	leaderTTL, err := envSeconds("GROK2API_MAINTAINER_LEADER_TTL", 30*time.Second, 5*time.Second, 10*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	leaderRenew, err := envSeconds("GROK2API_MAINTAINER_LEADER_RENEW", 10*time.Second, 2*time.Second, 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		Host:                   envString("GROK2API_HOST", defaultHost),
@@ -162,6 +178,10 @@ func Load() (Config, error) {
 		SSEKeepalive:           keepalive,
 		RequestTimeout:         timeout,
 		OutboundMaxTools:       outboundMaxTools,
+		Workers:                workers,
+		MaintainerLeader:       strings.ToLower(strings.TrimSpace(envString("GROK2API_MAINTAINER_LEADER", "auto"))),
+		MaintainerLeaderTTL:    leaderTTL,
+		MaintainerLeaderRenew:  leaderRenew,
 	}, nil
 }
 

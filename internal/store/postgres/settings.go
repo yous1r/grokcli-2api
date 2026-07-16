@@ -414,3 +414,16 @@ func asFloat(value any) (float64, bool) {
 		return 0, false
 	}
 }
+
+func (c *Connector) GetSetting(ctx context.Context, key string) (any, error) {
+	row := c.Pool.QueryRow(ctx, `SELECT value FROM app_settings WHERE key = $1`, key)
+	var data []byte
+	if err := row.Scan(&data); err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}

@@ -22,7 +22,7 @@ func (c *Client) GetAffinity(ctx context.Context, fingerprint string, ttl time.D
 	if fingerprint == "" {
 		return nil, nil
 	}
-	raw, err := c.command(ctx, "GET", c.key("affinity", fingerprint))
+	raw, err := c.Get(ctx, c.key("affinity", fingerprint))
 	if err != nil || strings.TrimSpace(raw) == "" {
 		return nil, err
 	}
@@ -46,7 +46,7 @@ func (c *Client) BindAffinity(ctx context.Context, fingerprint, accountID string
 	}
 	now := unixFloat(time.Now())
 	entry := AffinityEntry{AccountID: accountID, BoundAt: now, LastSeen: now, Hits: 1}
-	raw, _ := c.command(ctx, "GET", c.key("affinity", fingerprint))
+	raw, _ := c.Get(ctx, c.key("affinity", fingerprint))
 	if prev := parseAffinity(raw); prev != nil {
 		entry.BoundAt = prev.BoundAt
 		entry.Hits = prev.Hits + 1
@@ -67,8 +67,7 @@ func (c *Client) ClearAffinity(ctx context.Context, fingerprint string) error {
 	if fingerprint == "" {
 		return nil
 	}
-	_, err := c.command(ctx, "DEL", c.key("affinity", fingerprint))
-	return err
+	return c.Del(ctx, c.key("affinity", fingerprint))
 }
 
 func (c *Client) setAffinity(ctx context.Context, fingerprint string, entry AffinityEntry, ttl time.Duration) error {
@@ -79,8 +78,7 @@ func (c *Client) setAffinity(ctx context.Context, fingerprint string, entry Affi
 	if err != nil {
 		return err
 	}
-	_, err = c.command(ctx, "SET", c.key("affinity", fingerprint), string(data), "EX", stringInt(int(ttl.Seconds())))
-	return err
+	return c.SetEX(ctx, c.key("affinity", fingerprint), string(data), int(ttl.Seconds()))
 }
 
 func parseAffinity(raw string) *AffinityEntry {

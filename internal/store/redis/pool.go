@@ -13,11 +13,7 @@ const (
 )
 
 func (c *Client) RRNext(ctx context.Context) (int64, error) {
-	value, err := c.command(ctx, "INCR", c.key("rr", "index"))
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	return c.Incr(ctx, c.key("rr", "index"))
 }
 
 func (c *Client) MarkInflight(ctx context.Context, accountID string, ttlSeconds int) (int64, error) {
@@ -29,12 +25,12 @@ func (c *Client) MarkInflight(ctx context.Context, accountID string, ttlSeconds 
 		ttlSeconds = InflightTTLSeconds
 	}
 	key := c.key("inflight", accountID)
-	value, err := c.command(ctx, "INCR", key)
+	value, err := c.Incr(ctx, key)
 	if err != nil {
 		return 0, err
 	}
-	_, _ = c.command(ctx, "EXPIRE", key, strconv.Itoa(ttlSeconds))
-	return strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	_ = c.Expire(ctx, key, ttlSeconds)
+	return value, nil
 }
 
 func (c *Client) ReleaseInflight(ctx context.Context, accountID string) error {
@@ -43,17 +39,14 @@ func (c *Client) ReleaseInflight(ctx context.Context, accountID string) error {
 		return nil
 	}
 	key := c.key("inflight", accountID)
-	value, err := c.command(ctx, "DECR", key)
+	n, err := c.Decr(ctx, key)
 	if err != nil {
 		return err
 	}
-	n, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	if n <= 0 {
-		_, err = c.command(ctx, "DEL", key)
-		return err
+		return c.Del(ctx, key)
 	}
-	_, err = c.command(ctx, "EXPIRE", key, strconv.Itoa(InflightTTLSeconds))
-	return err
+	return c.Expire(ctx, key, InflightTTLSeconds)
 }
 
 func (c *Client) GetInflight(ctx context.Context, accountID string) (int64, error) {
@@ -61,7 +54,7 @@ func (c *Client) GetInflight(ctx context.Context, accountID string) (int64, erro
 	if accountID == "" {
 		return 0, nil
 	}
-	value, err := c.command(ctx, "GET", c.key("inflight", accountID))
+	value, err := c.Get(ctx, c.key("inflight", accountID))
 	if err != nil || strings.TrimSpace(value) == "" {
 		return 0, err
 	}
@@ -84,7 +77,7 @@ func (c *Client) MarkSoftUsed(ctx context.Context, accountID string, ttlSeconds 
 		now = time.Now()
 	}
 	stamp := float64(now.UnixNano()) / 1e9
-	_, err := c.command(ctx, "SET", c.key("soft_used", accountID), strconv.FormatFloat(stamp, 'f', 6, 64), "EX", strconv.Itoa(ttlSeconds))
+	err := c.SetEX(ctx, c.key("soft_used", accountID), strconv.FormatFloat(stamp, 'f', 6, 64), ttlSeconds)
 	return stamp, err
 }
 
@@ -95,13 +88,122 @@ func (c *Client) MirrorCooldown(ctx context.Context, accountID string, until tim
 	}
 	key := c.key("cooldown", accountID)
 	if until.IsZero() || !until.After(time.Now()) {
-		_, err := c.command(ctx, "DEL", key)
-		return err
+		return c.Del(ctx, key)
 	}
 	ttl := int(time.Until(until).Seconds())
 	if ttl < 1 {
 		ttl = 1
 	}
-	_, err := c.command(ctx, "SET", key, strconv.FormatInt(until.Unix(), 10), "EX", strconv.Itoa(ttl))
-	return err
+	// Python stores float unix seconds as string.
+	return c.SetEX(ctx, key, strconv.FormatFloat(float64(until.Unix()), 'f', 0, 64), ttl)
+}
+
+type PoolStatsTouch struct {
+	Success          bool
+	Error            string
+	CooldownUntil    *time.Time
+	ClearCooldown    bool
+	ConsecutiveFails *int64
+	LastStatusCode   *int
+	CooldownSec      *float64
+}
+
+// TouchStats mirrors Python pool_redis.touch_stats hot counters.
+func (c *Client) TouchStats(ctx context.Context, accountID string, touch PoolStatsTouch) (map[string]any, error) {
+	accountID = strings.TrimSpace(accountID)
+	if !c.Enabled() || accountID == "" {
+		return nil, nil
+	}
+	k := c.key("stats", accountID)
+	if _, err := c.HIncrBy(ctx, k, "request_count", 1); err != nil {
+		return nil, err
+	}
+	if touch.Success {
+		_, _ = c.HIncrBy(ctx, k, "success_count", 1)
+	} else {
+		_, _ = c.HIncrBy(ctx, k, "fail_count", 1)
+	}
+	mapping := map[string]string{
+		"last_used_at": strconv.FormatFloat(float64(time.Now().UnixNano())/1e9, 'f', 6, 64),
+	}
+	if strings.TrimSpace(touch.Error) != "" {
+		errText := strings.TrimSpace(touch.Error)
+		if len(errText) > 500 {
+			errText = errText[:500]
+		}
+		mapping["last_error"] = errText
+	}
+	if touch.Success {
+		mapping["consecutive_fails"] = "0"
+	} else if touch.ConsecutiveFails != nil {
+		mapping["consecutive_fails"] = strconv.FormatInt(*touch.ConsecutiveFails, 10)
+	}
+	if touch.LastStatusCode != nil {
+		mapping["last_status_code"] = strconv.Itoa(*touch.LastStatusCode)
+	}
+	if touch.CooldownSec != nil {
+		mapping["cooldown_sec"] = strconv.FormatFloat(*touch.CooldownSec, 'f', 3, 64)
+	}
+	_ = c.HSetMap(ctx, k, mapping)
+	if touch.CooldownUntil != nil {
+		_ = c.MirrorCooldown(ctx, accountID, *touch.CooldownUntil)
+	}
+	if touch.ClearCooldown {
+		_ = c.MirrorCooldown(ctx, accountID, time.Time{})
+		_ = c.HSetMap(ctx, k, map[string]string{"consecutive_fails": "0", "cooldown_sec": "0"})
+	}
+	return c.GetStats(ctx, accountID)
+}
+
+func (c *Client) GetStats(ctx context.Context, accountID string) (map[string]any, error) {
+	accountID = strings.TrimSpace(accountID)
+	if !c.Enabled() || accountID == "" {
+		return map[string]any{}, nil
+	}
+	raw, err := c.HGetAll(ctx, c.key("stats", accountID))
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{}
+	for _, field := range []string{"request_count", "success_count", "fail_count", "consecutive_fails", "last_status_code"} {
+		if v, ok := raw[field]; ok {
+			if n, err := strconv.ParseFloat(v, 64); err == nil {
+				out[field] = int64(n)
+			}
+		}
+	}
+	if v, ok := raw["cooldown_sec"]; ok {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			out["cooldown_sec"] = n
+		}
+	}
+	if v, ok := raw["last_used_at"]; ok {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			out["last_used_at"] = n
+		}
+	}
+	if v := strings.TrimSpace(raw["last_error"]); v != "" {
+		out["last_error"] = v
+	}
+	if cdRaw, err := c.Get(ctx, c.key("cooldown", accountID)); err == nil && strings.TrimSpace(cdRaw) != "" {
+		if n, err := strconv.ParseFloat(cdRaw, 64); err == nil {
+			out["cooldown_until"] = n
+		}
+	}
+	return out, nil
+}
+
+func (c *Client) GetInflightMany(ctx context.Context, accountIDs []string) map[string]int64 {
+	out := map[string]int64{}
+	for _, id := range accountIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		n, err := c.GetInflight(ctx, id)
+		if err == nil {
+			out[id] = n
+		}
+	}
+	return out
 }

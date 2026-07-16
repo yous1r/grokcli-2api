@@ -75,7 +75,19 @@ func (c *Client) StopAll(ctx context.Context) (map[string]any, error) {
 	return c.do(ctx, http.MethodPost, "/stop", map[string]any{}, nil)
 }
 
+func (c *Client) StartSSOImport(ctx context.Context, request map[string]any) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodPost, "/internal/sso/v1/import", request, nil)
+}
+
+func (c *Client) SSOImportJob(ctx context.Context, jobID string) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/sso/v1/jobs/"+url.PathEscape(jobID), nil, nil)
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body any, headers http.Header) (map[string]any, error) {
+	return c.doAbsolute(ctx, method, "/internal/registration/"+APIVersion+path, body, headers)
+}
+
+func (c *Client) doAbsolute(ctx context.Context, method, absPath string, body any, headers http.Header) (map[string]any, error) {
 	if strings.TrimSpace(c.BaseURL) == "" {
 		return nil, errors.New("registration service URL is not configured")
 	}
@@ -88,7 +100,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, headers 
 		reader = bytes.NewReader(encoded)
 	}
 	request, err := http.NewRequestWithContext(ctx, method,
-		strings.TrimRight(c.BaseURL, "/")+"/internal/registration/"+APIVersion+path,
+		strings.TrimRight(c.BaseURL, "/")+absPath,
 		reader,
 	)
 	if err != nil {

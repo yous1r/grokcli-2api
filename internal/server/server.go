@@ -18,18 +18,24 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hm2899/grokcli-2api/internal/accounts"
 	"github.com/hm2899/grokcli-2api/internal/admin"
 	adminauth "github.com/hm2899/grokcli-2api/internal/admin/auth"
 	"github.com/hm2899/grokcli-2api/internal/auth"
 	"github.com/hm2899/grokcli-2api/internal/buildinfo"
 	"github.com/hm2899/grokcli-2api/internal/config"
+	"github.com/hm2899/grokcli-2api/internal/integrations"
+	"github.com/hm2899/grokcli-2api/internal/maintainer"
+	"github.com/hm2899/grokcli-2api/internal/modelhealth"
 	"github.com/hm2899/grokcli-2api/internal/models"
 	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
 	"github.com/hm2899/grokcli-2api/internal/protocol/responses"
 	"github.com/hm2899/grokcli-2api/internal/proxy"
+	"github.com/hm2899/grokcli-2api/internal/quota"
 	regclient "github.com/hm2899/grokcli-2api/internal/registration/client"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
+	"github.com/hm2899/grokcli-2api/internal/store/redis"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 )
 
@@ -52,6 +58,11 @@ type Options struct {
 	AdminSessions     admin.SessionVerifier
 	PickObserver      proxy.PickObserver
 	AffinityStore     proxy.AffinityStore
+	Redis             *redis.Client
+	Leader            *redis.Leader
+	Maintainer        *maintainer.Service
+	ModelHealth       *modelhealth.Service
+	Quota             *quota.Service
 	Config            config.Config
 	RegistrationURL   string
 	RegistrationToken string
@@ -280,6 +291,114 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /admin/api/accounts/register-email/stop", func(w http.ResponseWriter, r *http.Request) {
 		serveRegistrationStopAll(w, r, options)
 	})
+	mux.HandleFunc("POST /admin/api/accounts/import-sso", func(w http.ResponseWriter, r *http.Request) {
+		serveSSOImportStart(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/import-sso/jobs/{job_id}", func(w http.ResponseWriter, r *http.Request) {
+		serveSSOImportJob(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/import", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminImportAccount(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/export", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminExportAccounts(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/export-batch", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminExportAccountsBatch(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/delete-batch", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminDeleteAccountsBatch(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/logout", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminClearAllAccounts(w, r, options)
+	})
+	mux.HandleFunc("DELETE /admin/api/accounts/{account_id}", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminDeleteAccount(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/{account_id}/probe", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminProbeAccount(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/probe-batch", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminProbeBatch(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/probe-all", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminProbeAll(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/model-health", func(w http.ResponseWriter, r *http.Request) {
+		serveModelHealthStatus(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/maintainer", func(w http.ResponseWriter, r *http.Request) {
+		serveMaintainerStatus(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/maintainer/run", func(w http.ResponseWriter, r *http.Request) {
+		serveMaintainerRun(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/refresh", func(w http.ResponseWriter, r *http.Request) {
+		serveAccountsRefresh(w, r, options)
+	})
+	mux.HandleFunc("PUT /admin/api/settings/token-maintain", func(w http.ResponseWriter, r *http.Request) {
+		serveToggleTokenMaintain(w, r, options)
+	})
+	mux.HandleFunc("PUT /admin/api/settings/model-health", func(w http.ResponseWriter, r *http.Request) {
+		serveToggleModelHealth(w, r, options)
+	})
+	mux.HandleFunc("PUT /admin/api/settings/account-mode", func(w http.ResponseWriter, r *http.Request) {
+		serveSetAccountMode(w, r, options)
+	})
+	mux.HandleFunc("PUT /admin/api/settings/password", func(w http.ResponseWriter, r *http.Request) {
+		serveChangeAdminPassword(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/model-blocks/prune", func(w http.ResponseWriter, r *http.Request) {
+		servePruneModelBlocks(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/export-sso", func(w http.ResponseWriter, r *http.Request) {
+		serveExportAccountsSSO(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/export-sso", func(w http.ResponseWriter, r *http.Request) {
+		serveExportAccountsSSOSelected(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/import-file", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminImportFile(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/import-files", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminImportFiles(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/normalize", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminNormalizeAccounts(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/models/sync", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminModelsSync(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/quota", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminAccountsQuota(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/{account_id}/quota", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminAccountQuota(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/settings/cliproxyapi", func(w http.ResponseWriter, r *http.Request) {
+		serveIntegrationSettingsGet(w, r, options, "cliproxyapi_config")
+	})
+	mux.HandleFunc("PUT /admin/api/settings/cliproxyapi", func(w http.ResponseWriter, r *http.Request) {
+		serveIntegrationSettingsPut(w, r, options, "cliproxyapi_config")
+	})
+	mux.HandleFunc("POST /admin/api/settings/cliproxyapi/test", func(w http.ResponseWriter, r *http.Request) {
+		serveCLIProxyTest(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/export-cliproxyapi-format", func(w http.ResponseWriter, r *http.Request) {
+		serveExportCLIProxyFormat(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/push-cliproxyapi", func(w http.ResponseWriter, r *http.Request) {
+		servePushCLIProxy(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/settings/sub2api", func(w http.ResponseWriter, r *http.Request) {
+		serveIntegrationSettingsGet(w, r, options, "sub2api_config")
+	})
+	mux.HandleFunc("PUT /admin/api/settings/sub2api", func(w http.ResponseWriter, r *http.Request) {
+		serveIntegrationSettingsPut(w, r, options, "sub2api_config")
+	})
+	mux.HandleFunc("POST /admin/api/accounts/export-sub2api-format", func(w http.ResponseWriter, r *http.Request) {
+		serveExportSub2APIFormat(w, r, options)
+	})
 	return mux
 }
 
@@ -456,15 +575,12 @@ func releaseServerPick(options Options, accountID string) {
 	if options.PickObserver == nil || accountID == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	options.PickObserver.ReleasePick(ctx, accountID)
 }
 
 func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error) {
-	if options.Store == nil {
-		return
-	}
 	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
 	streamValue := stream
 	var apiKeyID string
@@ -476,53 +592,68 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 		errText = cause.Error()
 	}
 	latency := int(time.Since(started).Milliseconds())
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
-		RequestID:           requestID(r),
-		Implementation:      "go",
-		APIKeyID:            apiKeyID,
-		AccountID:           accountID,
-		Model:               model,
-		Protocol:            "openai_chat",
-		Path:                r.URL.Path,
-		Stream:              &streamValue,
-		OK:                  ok,
-		PromptTokens:        prompt,
-		CompletionTokens:    completion,
-		TotalTokens:         total,
-		CacheReadTokens:     cacheRead,
-		CacheCreationTokens: cacheCreate,
-		ReasoningTokens:     reasoning,
-		ClientIP:            clientIP(r),
-		UserAgent:           r.UserAgent(),
-		StatusCode:          &status,
-		LatencyMS:           &latency,
-		Error:               errText,
-		Detail:              map[string]any{"route": "go_chat"},
-	})
+	// Fire-and-forget with longer timeout - usage recording should not block response
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if options.Store != nil {
+			_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
+				RequestID:           requestID(r),
+				Implementation:      "go",
+				APIKeyID:            apiKeyID,
+				AccountID:           accountID,
+				Model:               model,
+				Protocol:            "openai_chat",
+				Path:                r.URL.Path,
+				Stream:              &streamValue,
+				OK:                  ok,
+				PromptTokens:        prompt,
+				CompletionTokens:    completion,
+				TotalTokens:         total,
+				CacheReadTokens:     cacheRead,
+				CacheCreationTokens: cacheCreate,
+				ReasoningTokens:     reasoning,
+				ClientIP:            clientIP(r),
+				UserAgent:           r.UserAgent(),
+				StatusCode:          &status,
+				LatencyMS:           &latency,
+				Error:               errText,
+				Detail:              map[string]any{"route": "go_chat"},
+			})
+		}
+		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
+	}()
 }
 
 func reportChatPool(r *http.Request, options Options, accountID string, ok bool, cause error, status int) {
-	if options.Store == nil || strings.TrimSpace(accountID) == "" {
+	if strings.TrimSpace(accountID) == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if ok {
-		_ = options.Store.ReportPoolSuccess(ctx, accountID, true)
-		return
-	}
-	var cooldown *time.Time
-	if status == http.StatusTooManyRequests || status >= 500 {
-		until := time.Now().Add(15 * time.Minute)
-		cooldown = &until
-	}
-	var errText string
-	if cause != nil {
-		errText = cause.Error()
-	}
-	_ = options.Store.ReportPoolFailure(ctx, postgres.PoolFailure{AccountID: accountID, Error: errText, StatusCode: &status, CooldownUntil: cooldown, CooldownReason: errText, Detail: map[string]any{"source": "go_chat"}})
+	// Fire-and-forget pool reporting - should not block response
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if ok {
+			if options.Store != nil {
+				_ = options.Store.ReportPoolSuccess(ctx, accountID, true)
+			}
+			touchRedisPool(options, accountID, true, "", nil, status)
+			return
+		}
+		var cooldown *time.Time
+		if status == http.StatusTooManyRequests || status >= 500 {
+			until := time.Now().Add(15 * time.Minute)
+			cooldown = &until
+		}
+		var errText string
+		if cause != nil {
+			errText = cause.Error()
+		}
+		if options.Store != nil {
+			_ = options.Store.ReportPoolFailure(ctx, postgres.PoolFailure{AccountID: accountID, Error: errText, StatusCode: &status, CooldownUntil: cooldown, CooldownReason: errText, Detail: map[string]any{"source": "go_chat"}})
+		}
+		touchRedisPool(options, accountID, false, errText, cooldown, status)
+	}()
 }
 
 func requestID(r *http.Request) string {
@@ -550,10 +681,25 @@ func clientIP(r *http.Request) string {
 
 func writeProxyError(w http.ResponseWriter, err error) {
 	status := http.StatusBadGateway
+	message := err.Error()
 	if errors.Is(err, pool.ErrNoEligibleAccounts) {
 		status = http.StatusServiceUnavailable
+		message = "No eligible accounts available. All accounts may be in cooldown or disabled."
 	}
-	writeJSON(w, status, map[string]any{"detail": err.Error()})
+	// 检查是否为上游错误并保留正确的状态码
+	var upstreamErr *grok.UpstreamError
+	if errors.As(err, &upstreamErr) {
+		// 对于 429/503 等上游错误，使用原始状态码
+		if upstreamErr.Status == http.StatusTooManyRequests || upstreamErr.Status == http.StatusServiceUnavailable {
+			status = upstreamErr.Status
+			message = upstreamErr.Body
+		} else if upstreamErr.Status >= 500 {
+			status = http.StatusBadGateway
+		} else if upstreamErr.Status >= 400 && upstreamErr.Status < 500 {
+			status = upstreamErr.Status
+		}
+	}
+	writeJSON(w, status, map[string]any{"detail": message})
 }
 
 func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
@@ -921,9 +1067,6 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errorType stri
 }
 
 func recordResponsesUsage(r *http.Request, options Options, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error) {
-	if options.Store == nil {
-		return
-	}
 	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
 	streamValue := stream
 	var errText string
@@ -931,30 +1074,36 @@ func recordResponsesUsage(r *http.Request, options Options, accountID, model str
 		errText = cause.Error()
 	}
 	latency := int(time.Since(started).Milliseconds())
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
-		RequestID:           requestID(r),
-		Implementation:      "go",
-		AccountID:           accountID,
-		Model:               model,
-		Protocol:            "openai_responses",
-		Path:                r.URL.Path,
-		Stream:              &streamValue,
-		OK:                  ok,
-		PromptTokens:        prompt,
-		CompletionTokens:    completion,
-		TotalTokens:         total,
-		CacheReadTokens:     cacheRead,
-		CacheCreationTokens: cacheCreate,
-		ReasoningTokens:     reasoning,
-		ClientIP:            clientIP(r),
-		UserAgent:           r.UserAgent(),
-		StatusCode:          &status,
-		LatencyMS:           &latency,
-		Error:               errText,
-		Detail:              map[string]any{"route": "go_responses"},
-	})
+	// Fire-and-forget with longer timeout - usage recording should not block response
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if options.Store != nil {
+			_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
+				RequestID:           requestID(r),
+				Implementation:      "go",
+				AccountID:           accountID,
+				Model:               model,
+				Protocol:            "openai_responses",
+				Path:                r.URL.Path,
+				Stream:              &streamValue,
+				OK:                  ok,
+				PromptTokens:        prompt,
+				CompletionTokens:    completion,
+				TotalTokens:         total,
+				CacheReadTokens:     cacheRead,
+				CacheCreationTokens: cacheCreate,
+				ReasoningTokens:     reasoning,
+				ClientIP:            clientIP(r),
+				UserAgent:           r.UserAgent(),
+				StatusCode:          &status,
+				LatencyMS:           &latency,
+				Error:               errText,
+				Detail:              map[string]any{"route": "go_responses"},
+			})
+		}
+		recordRedisUsage(options, "", accountID, model, prompt, completion, total, ok)
+	}()
 }
 
 func responseToolCalls(calls []anthropic.ToolCall) []map[string]any {
@@ -1256,9 +1405,6 @@ func (p *disconnectProbe) check(ctx context.Context) bool {
 }
 
 func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error) {
-	if options.Store == nil {
-		return
-	}
 	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
 	streamValue := stream
 	var apiKeyID string
@@ -1270,31 +1416,37 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 		errText = cause.Error()
 	}
 	latency := int(time.Since(started).Milliseconds())
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
-		RequestID:           requestID(r),
-		Implementation:      "go",
-		APIKeyID:            apiKeyID,
-		AccountID:           accountID,
-		Model:               model,
-		Protocol:            "anthropic",
-		Path:                r.URL.Path,
-		Stream:              &streamValue,
-		OK:                  ok,
-		PromptTokens:        prompt,
-		CompletionTokens:    completion,
-		TotalTokens:         total,
-		CacheReadTokens:     cacheRead,
-		CacheCreationTokens: cacheCreate,
-		ReasoningTokens:     reasoning,
-		ClientIP:            clientIP(r),
-		UserAgent:           r.UserAgent(),
-		StatusCode:          &status,
-		LatencyMS:           &latency,
-		Error:               errText,
-		Detail:              map[string]any{"route": "go_messages"},
-	})
+	// Fire-and-forget with longer timeout - usage recording should not block response
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if options.Store != nil {
+			_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
+				RequestID:           requestID(r),
+				Implementation:      "go",
+				APIKeyID:            apiKeyID,
+				AccountID:           accountID,
+				Model:               model,
+				Protocol:            "anthropic",
+				Path:                r.URL.Path,
+				Stream:              &streamValue,
+				OK:                  ok,
+				PromptTokens:        prompt,
+				CompletionTokens:    completion,
+				TotalTokens:         total,
+				CacheReadTokens:     cacheRead,
+				CacheCreationTokens: cacheCreate,
+				ReasoningTokens:     reasoning,
+				ClientIP:            clientIP(r),
+				UserAgent:           r.UserAgent(),
+				StatusCode:          &status,
+				LatencyMS:           &latency,
+				Error:               errText,
+				Detail:              map[string]any{"route": "go_messages"},
+			})
+		}
+		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
+	}()
 }
 
 func anthropicCompletionParts(payload map[string]any) (content, reasoning, finish string, usage anthropic.Usage, calls []anthropic.ToolCall) {
@@ -1429,11 +1581,30 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 			setupNeeded = !has
 		}
 	}
+	// 构建前端兼容的数据库状态
+	redisEnabled := options.Redis != nil && options.Redis.Enabled()
+	redisConfigured := strings.TrimSpace(options.Config.RedisURL) != ""
+	pgEnabled := store != nil
+	pgConfigured := strings.TrimSpace(options.Config.DatabaseURL) != ""
+
 	payload := map[string]any{
 		"ok":                   true,
 		"setup_needed":         setupNeeded,
 		"version":              buildinfo.Version,
-		"store":                map[string]any{"backend": "hybrid", "postgres": store != nil},
+		"store": map[string]any{
+			"backend": "hybrid",
+			"postgres": map[string]any{
+				"ok":         pgEnabled,
+				"enabled":    pgEnabled,
+				"configured": pgConfigured,
+			},
+			"redis": map[string]any{
+				"ok":         redisEnabled,
+				"enabled":    redisEnabled,
+				"configured": redisConfigured,
+			},
+			"workers": options.Config.Workers,
+		},
 		"host":                 options.Config.Host,
 		"port":                 options.Config.Port,
 		"upstream":             options.Config.UpstreamBase,
@@ -1452,11 +1623,13 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 		"keys":                  keyStats,
 		"models_count":          modelCount,
 		"settings":              map[string]any{},
-		"token_maintainer":      map[string]any{"enabled": false, "implementation": "go", "started": false},
-		"model_health":          map[string]any{"enabled": false, "implementation": "go", "started": false},
-		"conversation_affinity": map[string]any{"enabled": false, "implementation": "go"},
+		"token_maintainer":      serviceStatus(options.Maintainer, options),
+		"model_health":          serviceStatus(options.ModelHealth, options),
+		"conversation_affinity": map[string]any{"enabled": options.AffinityStore != nil, "implementation": "go"},
 		"registration":          map[string]any{"mode": options.Config.RegistrationMode, "external": true, "available": options.Config.RegistrationServiceURL != ""},
-		"usage":                 map[string]any{"today_requests": 0, "today_tokens": 0, "total_tokens": 0},
+		"usage":                 usageLightSnapshot(r.Context(), options),
+		"leader":                leaderStatus(r.Context(), options),
+		"redis":                 map[string]any{"enabled": redisEnabled, "prefix": options.Config.RedisPrefix},
 	}
 	if protected {
 		payload["credentials"] = map[string]any{"email": nil, "active_count": pool.Live, "account_count": accountCount, "ok": pool.Live > 0}
@@ -1583,6 +1756,58 @@ func requireAdminReadWrite(w http.ResponseWriter, r *http.Request, options Optio
 	return true
 }
 
+func recordRedisUsage(options Options, apiKeyID, accountID, model string, prompt, completion, total int64, ok bool) {
+	if options.Redis == nil || !options.Redis.Enabled() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = options.Redis.RecordUsage(ctx, redis.UsageDeltas{
+		PromptTokens:     prompt,
+		CompletionTokens: completion,
+		TotalTokens:      total,
+		OK:               ok,
+		APIKeyID:         apiKeyID,
+		AccountID:        accountID,
+		Model:            model,
+		TS:               time.Now().UTC(),
+	})
+}
+
+func touchRedisPool(options Options, accountID string, success bool, errText string, cooldown *time.Time, status int) {
+	if options.Redis == nil || !options.Redis.Enabled() || strings.TrimSpace(accountID) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	touch := redis.PoolStatsTouch{Success: success, Error: errText, CooldownUntil: cooldown, LastStatusCode: &status}
+	_, _ = options.Redis.TouchStats(ctx, accountID, touch)
+}
+
+func usageLightSnapshot(ctx context.Context, options Options) map[string]any {
+	if options.Redis != nil && options.Redis.Enabled() {
+		return options.Redis.LightSnapshot(ctx)
+	}
+	return map[string]any{"today_requests": 0, "today_tokens": 0, "total_tokens": 0, "source": "none"}
+}
+
+func leaderStatus(ctx context.Context, options Options) map[string]any {
+	if options.Leader != nil {
+		return options.Leader.Status(ctx)
+	}
+	return map[string]any{"is_leader": false, "mode": options.Config.MaintainerLeader, "implementation": "go", "started": false}
+}
+
+func maintainerStatus(options Options) map[string]any {
+	started := options.Config.GoMaintainer && options.Leader != nil && options.Leader.IsLeader()
+	return map[string]any{
+		"enabled":         options.Config.GoMaintainer,
+		"implementation":  "go",
+		"started":         started,
+		"leader_required": options.Config.Workers > 1,
+	}
+}
+
 func writeRegistrationError(w http.ResponseWriter, err error) {
 	var re *regclient.Error
 	if errors.As(err, &re) {
@@ -1594,6 +1819,47 @@ func writeRegistrationError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeJSON(w, http.StatusBadGateway, map[string]any{"detail": err.Error()})
+}
+
+func serveSSOImportStart(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration/sso service URL is not configured"})
+		return
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	payload, err := client.StartSSOImport(r.Context(), body)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveSSOImportJob(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration/sso service URL is not configured"})
+		return
+	}
+	payload, err := client.SSOImportJob(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func serveRegistrationAvailability(w http.ResponseWriter, r *http.Request, options Options) {
@@ -2049,6 +2315,1053 @@ func serveAdminSetAccountEnabled(w http.ResponseWriter, r *http.Request, options
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": rec})
 }
 
+func serveAdminImportAccount(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	merge := true
+	if v, ok := body["merge"].(bool); ok {
+		merge = v
+	}
+	payload := body["payload"]
+	if payload == nil {
+		// allow bare auth object / token fields at top level
+		payload = body
+	}
+	normalized := accounts.CollectNormalizedEntries(payload)
+	if !normalized.OK {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "detail": normalized.Error, "error": normalized.Error})
+		return
+	}
+	result, err := options.Store.ImportNormalizedAccounts(r.Context(), normalized.Normalized, merge)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if normalized.Format != "" {
+		result["format"] = normalized.Format
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveAdminExportAccounts(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	includeSecrets := r.URL.Query().Get("include_secrets") != "0" && r.URL.Query().Get("include_secrets") != "false"
+	result, err := options.Store.ExportAuthMap(r.Context(), nil, includeSecrets)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveAdminExportAccountsBatch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	includeSecrets := true
+	if v, ok := body["include_secrets"].(bool); ok {
+		includeSecrets = v
+	}
+	ids := stringSlice(body["ids"])
+	result, err := options.Store.ExportAuthMap(r.Context(), ids, includeSecrets)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveAdminDeleteAccount(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	accountID := r.PathValue("account_id")
+	if strings.HasPrefix(accountID, "register-email") || strings.Contains(accountID, "/register-email") {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Not found"})
+		return
+	}
+	ok, err := options.Store.DeleteAccount(r.Context(), accountID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Account not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func serveAdminDeleteAccountsBatch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	ids := stringSlice(body["ids"])
+	if len(ids) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "ids is required"})
+		return
+	}
+	if len(ids) > 2000 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "too many ids (max 2000)"})
+		return
+	}
+	result, err := options.Store.DeleteAccounts(r.Context(), ids)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	result["ok"] = true
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveAdminClearAllAccounts(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	n, err := options.Store.ClearAllAccounts(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"message": "已清空账号池",
+		"removed": n,
+	})
+}
+
+func stringSlice(value any) []string {
+	switch v := value.(type) {
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s := stringValue(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s := strings.TrimSpace(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func serveAdminProbeBatch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.ModelHealth == nil || options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "model health unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	ids := stringSlice(body["ids"])
+	if len(ids) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "ids is empty"})
+		return
+	}
+	if len(ids) > 500 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "too many ids (max 500)"})
+		return
+	}
+	model := stringValue(body["model"])
+	autoDisable := true
+	if v, ok := body["auto_disable"].(bool); ok {
+		autoDisable = v
+	}
+	results := options.ModelHealth.ProbeIDs(r.Context(), ids, model, autoDisable, "manual")
+	// attach pool views
+	out := make([]map[string]any, 0, len(results))
+	for _, item := range results {
+		aid := stringValue(item["account_id"])
+		if pool, err := options.Store.GetAccountPoolView(r.Context(), aid); err == nil {
+			item["pool"] = pool
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": out, "count": len(out)})
+}
+
+func serveAdminProbeAll(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.ModelHealth == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "model health unavailable"})
+		return
+	}
+	result := options.ModelHealth.RunOnce(r.Context(), "manual_all")
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveModelHealthStatus(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.ModelHealth == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "implementation": "go", "started": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, options.ModelHealth.Status())
+}
+
+func serveMaintainerStatus(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Maintainer == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "implementation": "go", "started": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, options.Maintainer.Status())
+}
+
+func serveMaintainerRun(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Maintainer == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "maintainer unavailable"})
+		return
+	}
+	force := true
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if v, ok := body["force"].(bool); ok {
+			force = v
+		}
+	}
+	writeJSON(w, http.StatusOK, options.Maintainer.RunOnce(r.Context(), force))
+}
+
+func serveAccountsRefresh(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Maintainer == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "maintainer unavailable"})
+		return
+	}
+	force := true
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if v, ok := body["force"].(bool); ok {
+		force = v
+	}
+	// selected ids currently use same batch path (best-effort full cycle)
+	result := options.Maintainer.RunOnce(r.Context(), force)
+	result["maintainer"] = options.Maintainer.Status()
+	result["token_maintainer"] = result["maintainer"]
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveToggleTokenMaintain(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	enabled, ok := body["enabled"].(bool)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "enabled bool required"})
+		return
+	}
+	if err := options.Store.SetSetting(r.Context(), "token_maintain_enabled", enabled); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if options.Maintainer != nil {
+		if enabled {
+			options.Maintainer.Start()
+			options.Maintainer.RequestRunSoon(false)
+		} else {
+			options.Maintainer.Stop()
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                     true,
+		"token_maintain_enabled": enabled,
+		"settings":               map[string]any{"token_maintain_enabled": enabled},
+		"maintainer":             serviceStatus(options.Maintainer, options),
+		"token_maintainer":       serviceStatus(options.Maintainer, options),
+	})
+}
+
+func serveToggleModelHealth(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	enabled, ok := body["enabled"].(bool)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "enabled bool required"})
+		return
+	}
+	if err := options.Store.SetSetting(r.Context(), "model_health_enabled", enabled); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if options.ModelHealth != nil {
+		if enabled {
+			options.ModelHealth.Start()
+			options.ModelHealth.RequestRunSoon()
+		} else {
+			options.ModelHealth.Stop()
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                   true,
+		"model_health_enabled": enabled,
+		"settings":             map[string]any{"model_health_enabled": enabled},
+		"model_health":         serviceStatus(options.ModelHealth, options),
+	})
+}
+
+func serveSetAccountMode(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	mode := strings.ToLower(stringValue(body["mode"]))
+	switch mode {
+	case "round_robin", "random", "least_used":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "Invalid account_mode. Use one of: round_robin, random, least_used"})
+		return
+	}
+	if err := options.Store.SetSetting(r.Context(), "account_mode", mode); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account_mode": mode, "modes": []string{"round_robin", "random", "least_used"}})
+}
+
+func serveChangeAdminPassword(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	current := stringValue(body["current_password"])
+	newPW := stringValue(body["new_password"])
+	confirm := stringValue(body["confirm_password"])
+	if len(newPW) < 4 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "password must contain at least 4 characters"})
+		return
+	}
+	if confirm != "" && confirm != newPW {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "两次输入的新密码不一致"})
+		return
+	}
+	ok, err := verifyAdminPassword(r.Context(), options, current)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "当前密码不正确"})
+		return
+	}
+	hash, salt, err := adminauth.NewPassword(newPW)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if err := options.Store.SetAdminPassword(r.Context(), hash, salt); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	settings, _ := options.Store.PublicSettings(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "密码已更新", "settings": settings})
+}
+
+func servePruneModelBlocks(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	n, err := options.Store.PruneModelBlocks(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pruned": n})
+}
+
+func serveExportAccountsSSO(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	authMap, err := options.Store.ExportAuthMap(r.Context(), nil, true)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, buildSSOExport(authMap))
+}
+
+func serveExportAccountsSSOSelected(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	ids := stringSlice(body["ids"])
+	authMap, err := options.Store.ExportAuthMap(r.Context(), ids, true)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, buildSSOExport(authMap))
+}
+
+func serveAdminImportFile(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		// also accept JSON body {payload, merge}
+		var body map[string]any
+		if jerr := json.NewDecoder(r.Body).Decode(&body); jerr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+			return
+		}
+		merge := true
+		if v, ok := body["merge"].(bool); ok {
+			merge = v
+		}
+		norm := accounts.CollectNormalizedEntries(body["payload"])
+		if !norm.OK {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": norm.Error})
+			return
+		}
+		result, err := options.Store.ImportNormalizedAccounts(r.Context(), norm.Normalized, merge)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	merge := true
+	if v := r.FormValue("merge"); v == "0" || strings.EqualFold(v, "false") {
+		merge = false
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		// try "files"
+		file, _, err = r.FormFile("files")
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "file required"})
+		return
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, 16<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	norm := accounts.CollectNormalizedEntries(string(raw))
+	if !norm.OK {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": norm.Error})
+		return
+	}
+	result, err := options.Store.ImportNormalizedAccounts(r.Context(), norm.Normalized, merge)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if norm.Format != "" {
+		result["format"] = norm.Format
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveAdminImportFiles(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	merge := true
+	if v := r.FormValue("merge"); v == "0" || strings.EqualFold(v, "false") {
+		merge = false
+	}
+	files := r.MultipartForm.File["files"]
+	if len(files) == 0 {
+		files = r.MultipartForm.File["file"]
+	}
+	if len(files) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "files required"})
+		return
+	}
+	normalized := map[string]map[string]any{}
+	fileResults := []map[string]any{}
+	parseErrors := 0
+	for i, fh := range files {
+		f, err := fh.Open()
+		if err != nil {
+			parseErrors++
+			fileResults = append(fileResults, map[string]any{"index": i + 1, "ok": false, "error": err.Error()})
+			continue
+		}
+		raw, _ := io.ReadAll(io.LimitReader(f, 16<<20))
+		f.Close()
+		norm := accounts.CollectNormalizedEntries(string(raw))
+		if !norm.OK {
+			parseErrors++
+			fileResults = append(fileResults, map[string]any{"index": i + 1, "ok": false, "error": norm.Error, "format": norm.Format})
+			continue
+		}
+		for k, v := range norm.Normalized {
+			normalized[k] = v
+		}
+		fileResults = append(fileResults, map[string]any{"index": i + 1, "ok": true, "count": len(norm.Normalized), "format": norm.Format})
+	}
+	if len(normalized) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "no valid account entries found", "file_results": fileResults, "parse_errors": parseErrors})
+		return
+	}
+	result, err := options.Store.ImportNormalizedAccounts(r.Context(), normalized, merge)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	result["files"] = len(files)
+	result["parse_errors"] = parseErrors
+	result["file_results"] = fileResults
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveAdminNormalizeAccounts(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	result, err := options.Store.NormalizeAccountKeys(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func serveAdminModelsSync(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	authList, err := options.Store.ListAccountAuths(r.Context(), 20, true)
+	if err != nil || len(authList) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "no live account for models sync"})
+		return
+	}
+	a := authList[0]
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(options.Config.UpstreamBase, "/")+"/models", nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	gc := &grok.Client{BaseURL: options.Config.UpstreamBase}
+	for k, v := range gc.Headers(a.Token, options.Config.DefaultModel) {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode >= 400 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": fmt.Sprintf("upstream %d: %s", resp.StatusCode, string(body)[:minInt(300, len(body))])})
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "parse: " + err.Error()})
+		return
+	}
+	data, _ := payload["data"].([]any)
+	items := []map[string]any{}
+	for _, raw := range data {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := stringValue(m["id"])
+		if id == "" {
+			continue
+		}
+		item := map[string]any{"id": id, "owned_by": firstNonEmptyStr(stringValue(m["owned_by"]), "xai")}
+		if n := stringValue(m["name"]); n != "" {
+			item["name"] = n
+		}
+		if d := stringValue(m["description"]); d != "" {
+			item["description"] = d
+		}
+		if cw, ok := m["context_window"]; ok {
+			item["context_window"] = cw
+		}
+		items = append(items, item)
+	}
+	if len(items) == 0 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "no models in upstream response"})
+		return
+	}
+	n, err := options.Store.ReplaceModels(r.Context(), items, map[string]any{"source": "upstream", "fetched_via": a.Email, "origin": strings.TrimRight(options.Config.UpstreamBase, "/") + "/models"})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": n, "pg_count": n, "fetched_via": a.Email, "storage": "postgres", "models": modelCatalog(options).PublicModels(r.Context())})
+}
+
+func serveAdminAccountsQuota(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Quota == nil {
+		// fallback store-only cached
+		if options.Store == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+			return
+		}
+		out, err := options.Store.ListCachedQuotas(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	cached := r.URL.Query().Get("cached") == "1" || r.URL.Query().Get("cached") == "true"
+	refresh := r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true"
+	if cached && !refresh {
+		out, err := options.Quota.FetchCached(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	out, err := options.Quota.FetchAll(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func serveAdminAccountQuota(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	// return cached for single account if present
+	all, err := options.Store.ListCachedQuotas(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	aid := r.PathValue("account_id")
+	results, _ := all["results"].([]map[string]any)
+	if results == nil {
+		if arr, ok := all["results"].([]any); ok {
+			for _, item := range arr {
+				if m, ok := item.(map[string]any); ok {
+					results = append(results, m)
+				}
+			}
+		}
+	}
+	for _, item := range results {
+		if stringValue(item["account_id"]) == aid {
+			writeJSON(w, http.StatusOK, item)
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotFound, map[string]any{"detail": "quota cache not found"})
+}
+
+func serveIntegrationSettingsGet(w http.ResponseWriter, r *http.Request, options Options, key string) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": integrations.PublicConfig(r.Context(), options.Store, key)})
+}
+
+func serveIntegrationSettingsPut(w http.ResponseWriter, r *http.Request, options Options, key string) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	doTest := false
+	if v, ok := body["test"].(bool); ok {
+		doTest = v
+		delete(body, "test")
+	}
+	cfg, err := integrations.SaveConfig(r.Context(), options.Store, key, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	out := map[string]any{"ok": true, "config": cfg}
+	if doTest && key == "cliproxyapi_config" {
+		// use raw secret
+		raw, _ := options.Store.GetSetting(r.Context(), key)
+		rm, _ := raw.(map[string]any)
+		test := integrations.TestCLIProxy(r.Context(), rm)
+		out["test"] = test
+		out["ok"] = test["ok"] == true
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func serveCLIProxyTest(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	raw, err := options.Store.GetSetting(r.Context(), "cliproxyapi_config")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "config missing"})
+		return
+	}
+	rm, _ := raw.(map[string]any)
+	test := integrations.TestCLIProxy(r.Context(), rm)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": test["ok"] == true, "test": test})
+}
+
+func serveExportCLIProxyFormat(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	ids := stringSlice(body["ids"])
+	if body["all"] == true {
+		ids = nil
+	}
+	out, err := integrations.ExportCLIProxyBundle(r.Context(), options.Store, ids)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func servePushCLIProxy(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	ids := stringSlice(body["account_ids"])
+	if body["all"] == true || body["account_ids"] == nil {
+		ids = nil
+	}
+	out, err := integrations.PushCLIProxy(r.Context(), options.Store, ids, 4)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func serveExportSub2APIFormat(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	ids := stringSlice(body["ids"])
+	if body["all"] == true {
+		ids = nil
+	}
+	out, err := integrations.ExportSub2APIFormat(r.Context(), options.Store, ids)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func firstNonEmptyStr(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func buildSSOExport(authMap map[string]any) map[string]any {
+	auth, _ := authMap["auth"].(map[string]any)
+	lines := []string{}
+	items := []map[string]any{}
+	for id, raw := range auth {
+		entry, _ := raw.(map[string]any)
+		sso := accounts.GetSSOValue(entry)
+		if sso == "" {
+			continue
+		}
+		email := ""
+		if entry != nil {
+			if v, ok := entry["email"].(string); ok {
+				email = v
+			}
+		}
+		line := sso
+		if email != "" {
+			line = email + "----" + sso
+		}
+		lines = append(lines, line)
+		items = append(items, map[string]any{"id": id, "email": email, "sso": sso})
+	}
+	return map[string]any{
+		"ok":    true,
+		"count": len(items),
+		"lines": lines,
+		"items": items,
+		"text":  strings.Join(lines, "\n"),
+	}
+}
+
+type statusProvider interface{ Status() map[string]any }
+
+func serviceStatus(svc statusProvider, options Options) map[string]any {
+	if svc == nil {
+		return map[string]any{"enabled": false, "implementation": "go", "started": false}
+	}
+	switch v := any(svc).(type) {
+	case *maintainer.Service:
+		if v == nil {
+			return map[string]any{"enabled": false, "implementation": "go", "started": false}
+		}
+	case *modelhealth.Service:
+		if v == nil {
+			return map[string]any{"enabled": false, "implementation": "go", "started": false}
+		}
+	}
+	return svc.Status()
+}
+
+func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	model := stringValue(body["model"])
+	if model == "" {
+		model = options.Config.DefaultModel
+	}
+	model = modelCatalog(options).Resolve(model)
+	auth, err := options.Store.GetAccountAuth(r.Context(), r.PathValue("account_id"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": err.Error()})
+		return
+	}
+	client := &grok.Client{BaseURL: options.Config.UpstreamBase}
+	// Lightweight connectivity probe: open a short streamed completion and abort after headers/body start.
+	probeBody := map[string]any{
+		"model":      model,
+		"stream":     true,
+		"max_tokens": 1,
+		"messages":   []any{map[string]any{"role": "user", "content": "ping"}},
+	}
+	started := time.Now()
+	resp, err := client.Open(r.Context(), grok.Account{ID: auth.ID, Token: auth.Token}, model, probeBody)
+	result := map[string]any{
+		"account_id": auth.ID,
+		"email":      auth.Email,
+		"model":      model,
+		"probed_at":  time.Now().Unix(),
+		"source":     "manual",
+	}
+	if err != nil {
+		status := 0
+		errText := err.Error()
+		var ue *grok.UpstreamError
+		if errors.As(err, &ue) {
+			status = ue.Status
+			errText = ue.Body
+			if len(errText) > 400 {
+				errText = errText[:400]
+			}
+		}
+		autoDisable, _ := body["auto_disable"].(bool)
+		if autoDisable && (status == 401 || status == 403) {
+			_, _ = options.Store.SetAccountEnabled(r.Context(), auth.ID, false)
+		}
+		result["available"] = false
+		result["error"] = errText
+		result["status_code"] = status
+		result["latency_ms"] = time.Since(started).Milliseconds()
+		poolView, _ := options.Store.GetAccountPoolView(r.Context(), auth.ID)
+		touchRedisPool(options, auth.ID, false, errText, nil, status)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "account_id": auth.ID, "email": auth.Email, "result": result, "pool": poolView})
+		return
+	}
+	// Drain a tiny amount then close.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+	_ = resp.Body.Close()
+	_ = options.Store.ReportPoolSuccess(r.Context(), auth.ID, true)
+	touchRedisPool(options, auth.ID, true, "", nil, resp.StatusCode)
+	result["available"] = true
+	result["status_code"] = resp.StatusCode
+	result["latency_ms"] = time.Since(started).Milliseconds()
+	poolView, _ := options.Store.GetAccountPoolView(r.Context(), auth.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account_id": auth.ID, "email": auth.Email, "result": result, "pool": poolView})
+}
+
 func serveAdminKickAccount(w http.ResponseWriter, r *http.Request, options Options) {
 	if !adminWriteAllowed(w, r, options) {
 		return
@@ -2099,6 +3412,10 @@ func serveAdminClearCooldown(w http.ResponseWriter, r *http.Request, options Opt
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": rec})
+	if options.Redis != nil {
+		_ = options.Redis.MirrorCooldown(r.Context(), r.PathValue("account_id"), time.Time{})
+		_, _ = options.Redis.TouchStats(r.Context(), r.PathValue("account_id"), redis.PoolStatsTouch{Success: true, ClearCooldown: true})
+	}
 }
 
 func adminWriteAllowed(w http.ResponseWriter, r *http.Request, options Options) bool {

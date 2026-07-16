@@ -72,3 +72,22 @@ func TestRegistrationFacadeGated(t *testing.T) {
 		t.Fatalf("registration without service url = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestAccountImportExportDeleteGated(t *testing.T) {
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/admin/api/accounts/import"},
+		{http.MethodGet, "/admin/api/accounts/export"},
+		{http.MethodPost, "/admin/api/accounts/delete-batch"},
+		{http.MethodDelete, "/admin/api/accounts/acc-1"},
+		{http.MethodPost, "/admin/api/accounts/import-sso"},
+	} {
+		rec := httptest.NewRecorder()
+		NewMux(Options{Ready: func() bool { return true }}).ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`)))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s %s disabled = %d body=%s", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+	}
+}

@@ -308,11 +308,15 @@ Supported now:
 - auth: setup/login/session/logout (Redis session preferred, PG fallback)
 - write: keys create / patch / regenerate / delete
 - write: accounts enable/disable, kick (cooldown/hard), cooldown clear
+- write: accounts JSON import/export/delete/logout (PostgreSQL-backed)
+- write: accounts single probe
 - write: settings PUT/PATCH runtime scalars (no registration/proxy secrets)
+- facade: registration-email + SSO import → Python sidecar
 
-Not yet in Go (stay on Python):
+Not yet in Go (Python sidecar / later):
 
-- account import/register/kick/enable bulk ops
-- model-health controls
-- registration execution
+- SSO conversion execution (`scripts/sso_to_auth_json.py` + browser/captcha)
+- registration machine execution + Turnstile solver
+- model-health background loops / probe-all
+- bulk multipart import-file jobs, sub2api/cliproxy push integrations
 - full runtime settings patch surface beyond public read

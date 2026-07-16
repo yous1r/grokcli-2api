@@ -21,10 +21,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     GROK2API_STORE_BACKEND=hybrid \
     GROK2API_RUNTIME=python \
     GROK2API_WORKERS=2 \
-    PYTHONPATH=/app/grok-build-auth \
+    # App code + vendored registration protocol client
+    PYTHONPATH=/app:/app/grok-build-auth \
     HOME=/root \
     DEBIAN_FRONTEND=noninteractive \
-    # Inline local captcha defaults (same container)
+    # Inline local captcha defaults (same container, Python)
     GROK2API_CAPTCHA_PROVIDER=local \
     CAPTCHA_PROVIDER=local \
     GROK2API_LOCAL_SOLVER_URL=http://127.0.0.1:5072 \
@@ -35,7 +36,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TURNSTILE_THREAD=3 \
     TURNSTILE_BROWSER_TYPE=camoufox \
     TURNSTILE_LAZY=1 \
-    TURNSTILE_IDLE_SEC=180
+    TURNSTILE_IDLE_SEC=180 \
+    # Python registration/SSO sidecar (loopback only; used when RUNTIME=go)
+    GROK2API_REGISTRATION_SIDECAR=1 \
+    GROK2API_REGISTRATION_HOST=127.0.0.1 \
+    GROK2API_REGISTRATION_PORT=18070 \
+    GROK2API_REGISTRATION_SERVICE_URL=http://127.0.0.1:18070
 
 WORKDIR /app
 
@@ -97,9 +103,11 @@ RUN chmod +x /app/entrypoint.sh /app/bin/grok2api /app/bin/grok2api-migrate \
     && test -f /app/grok2api/upstream/grok_build_adapter.py \
     && test -f /app/app.py \
     && test -f /app/turnstile-solver/api_solver.py \
+    && test -f /app/scripts/registration_service.py \
+    && test -f /app/scripts/sso_to_auth_json.py \
     && test -x /app/bin/grok2api \
     && test -x /app/bin/grok2api-migrate \
-    && python -c "import app; import grok2api.app as pkg_app; from grok2api.upstream import grok_build_adapter; print('build-check', pkg_app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD, app.APP_VERSION)"
+    && python -c "import app; import grok2api.app as pkg_app; from grok2api.upstream import grok_build_adapter; import scripts.registration_service as regsvc; print('build-check', pkg_app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD, app.APP_VERSION, 'reg-sidecar-ok')"
 
 EXPOSE 3000 5072
 
