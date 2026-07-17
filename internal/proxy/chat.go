@@ -85,7 +85,8 @@ type StreamOpen struct {
 }
 
 type StreamStats struct {
-	Usage any
+	Usage        any
+	FirstTokenMS int // 0 if never observed
 }
 
 func DecodeChatRequest(reader io.Reader) (ChatRequest, error) {
@@ -250,11 +251,18 @@ func ForwardChatStreamWithStats(reader io.Reader, emit func(StreamFrame) error) 
 		return StreamStats{}, fmt.Errorf("stream emitter is required")
 	}
 	var stats StreamStats
+	started := time.Now()
 	err := grok.ReadSSE(reader, func(event grok.Event) error {
 		if event.Done {
 			return emit(StreamFrame{Done: true})
 		}
-		delta, err := parseChatDelta(event.Data)
+		if stats.FirstTokenMS == 0 && len(event.Data) > 0 {
+			stats.FirstTokenMS = int(time.Since(started).Milliseconds())
+			if stats.FirstTokenMS <= 0 {
+				stats.FirstTokenMS = 1
+			}
+		}
+		delta, err := ParseChatDelta(event.Data)
 		if err != nil {
 			return nil
 		}
@@ -716,39 +724,71 @@ func numberToInt64(value any) (int64, bool) {
 // guardStreamAgainstEmpty peeks upstream SSE until the first model payload or
 // stream end. Empty HTTP 200 bodies can then failover before the client envelope
 // is opened. On success, returns a reader that replays peeked frames + remainder.
+//
+// 为了支持首字延迟较长的模型（如某些 newapi 实例），这里使用超时机制：
+// - 如果 1 秒内收到有效内容 → 正常返回
+// - 如果 1 秒内收到 [DONE] → 判定为空
+// - 如果 1 秒内没有收到任何数据 → 放弃检测，直接通过（避免误杀慢启动模型）
 func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 	if body == nil {
 		return nil, true, &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 	}
-	var buffered strings.Builder
-	sawModel := false
-	err := grok.ReadSSE(io.TeeReader(body, &buffered), func(event grok.Event) error {
-		if event.Done {
-			return errStopPeek
-		}
-		delta, err := parseChatDelta(event.Data)
-		if err != nil {
+
+	type peekResult struct {
+		sawModel bool
+		sawDone  bool
+		buffered string
+		err      error
+	}
+
+	resultCh := make(chan peekResult, 1)
+	go func() {
+		var buffered strings.Builder
+		sawModel := false
+		sawDone := false
+		err := grok.ReadSSE(io.TeeReader(body, &buffered), func(event grok.Event) error {
+			if event.Done {
+				sawDone = true
+				return errStopPeek
+			}
+			delta, parseErr := parseChatDelta(event.Data)
+			if parseErr != nil {
+				return nil
+			}
+			if strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
+				sawModel = true
+				return errStopPeek
+			}
 			return nil
+		})
+		if err != nil && !errors.Is(err, errStopPeek) {
+			resultCh <- peekResult{err: err}
+			return
 		}
-		if strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
-			sawModel = true
-			return errStopPeek
+		resultCh <- peekResult{sawModel: sawModel, sawDone: sawDone, buffered: buffered.String()}
+	}()
+
+	// Short empty-stream peek so healthy TTFT is not delayed.
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			_ = body.Close()
+			return nil, false, result.err
 		}
-		return nil
-	})
-	if err != nil && !errors.Is(err, errStopPeek) {
-		_ = body.Close()
-		return nil, false, err
+		if !result.sawModel && result.sawDone {
+			// 确实是空响应（收到 [DONE] 但没有内容）
+			_, _ = io.Copy(io.Discard, body)
+			_ = body.Close()
+			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		}
+		// 有内容或者流还在继续 → 正常返回
+		replayed := io.MultiReader(strings.NewReader(result.buffered), body)
+		return &multiClose{Reader: replayed, closer: body}, false, nil
+	case <-time.After(250 * time.Millisecond):
+		// Peek deadline elapsed: pass through without waiting for full first token.
+		// 注意：这里不关闭 body，让它继续流式输出
+		return body, false, nil
 	}
-	if !sawModel {
-		// Drain any remainder so we do not leak the connection, then signal empty.
-		_, _ = io.Copy(io.Discard, body)
-		_ = body.Close()
-		return io.NopCloser(strings.NewReader(buffered.String())), true, nil
-	}
-	// Replay peeked bytes then continue with the live body.
-	replayed := io.MultiReader(strings.NewReader(buffered.String()), body)
-	return &multiClose{Reader: replayed, closer: body}, false, nil
 }
 
 var errStopPeek = errors.New("stop peek")

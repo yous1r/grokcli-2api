@@ -113,25 +113,30 @@ func (c *Connector) ReplaceModels(ctx context.Context, items []map[string]any, m
 			supports = &v
 		}
 		sortOrder := (i + 1) * 10
+		synthetic := false
+		if v, ok := item["synthetic"].(bool); ok {
+			synthetic = v
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO models (
 				id, name, description, owned_by, hidden, synthetic,
 				context_window, supports_reasoning_effort, extra, sort_order, fetched_at, updated_at
 			) VALUES (
-				$1, NULLIF($2,''), NULLIF($3,''), $4, false, false,
+				$1, NULLIF($2,''), NULLIF($3,''), $4, false, $9,
 				$5, $6, $7::jsonb, $8, now(), now()
 			)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				description = EXCLUDED.description,
 				owned_by = EXCLUDED.owned_by,
+				synthetic = EXCLUDED.synthetic,
 				context_window = EXCLUDED.context_window,
 				supports_reasoning_effort = EXCLUDED.supports_reasoning_effort,
 				extra = EXCLUDED.extra,
 				sort_order = EXCLUDED.sort_order,
 				fetched_at = now(),
 				updated_at = now()
-		`, id, name, desc, ownedBy, ctxWin, supports, extraBytes, sortOrder); err != nil {
+`, id, name, desc, ownedBy, ctxWin, supports, extraBytes, sortOrder, synthetic); err != nil {
 			return 0, err
 		}
 		n++

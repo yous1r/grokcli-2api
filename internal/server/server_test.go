@@ -334,7 +334,7 @@ func TestResponsesRouteGates(t *testing.T) {
 func TestStreamAnthropicMessagesWritesSSE(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	usage, err := streamAnthropicMessages(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\",\"reasoning_content\":\"plan\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n"), "msg_test", "grok", false, nil, 0)
+	usage, _, err := streamAnthropicMessages(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\",\"reasoning_content\":\"plan\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n"), "msg_test", "grok", false, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestStreamAnthropicMessagesWritesSSE(t *testing.T) {
 func TestStreamAnthropicMessagesWritesToolUse(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	_, err := streamAnthropicMessages(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Edit\",\"arguments\":\"{\\\"file_path\\\":\\\"/x\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"), "msg_test", "grok", true, []string{"Edit"}, 1)
+	_, _, err := streamAnthropicMessages(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Edit\",\"arguments\":\"{\\\"file_path\\\":\\\"/x\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"), "msg_test", "grok", true, []string{"Edit"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestStreamAnthropicMessagesWritesToolUse(t *testing.T) {
 func TestStreamAnthropicMessagesEmitsThinkingDelta(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	_, err := streamAnthropicMessages(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), "msg_test", "grok", false, nil, 0)
+	_, _, err := streamAnthropicMessages(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), "msg_test", "grok", false, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestStreamAnthropicMessagesEmitsThinkingDelta(t *testing.T) {
 func TestStreamOpenAIResponsesWritesSSE(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	usage, err := streamOpenAIResponses(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n"), "resp_test", "grok", nil, 0)
+	usage, _, err := streamOpenAIResponses(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n"), "resp_test", "grok", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,7 @@ func TestStreamOpenAIResponsesWritesSSE(t *testing.T) {
 func TestStreamOpenAIResponsesWritesFunctionCall(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	_, err := streamOpenAIResponses(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Edit\",\"arguments\":\"{\\\"file_path\\\":\\\"/x\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"), "resp_test", "grok", []string{"Edit"}, 0)
+	_, _, err := streamOpenAIResponses(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Edit\",\"arguments\":\"{\\\"file_path\\\":\\\"/x\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"), "resp_test", "grok", []string{"Edit"}, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +510,7 @@ func TestStreamAnthropicKeepaliveEmitsPing(t *testing.T) {
 			"data: [DONE]\n\n",
 		},
 	}
-	_, err := streamAnthropicMessages(recorder, req, body, "msg_test", "grok", false, nil, 0)
+	_, _, err := streamAnthropicMessages(recorder, req, body, "msg_test", "grok", false, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +537,7 @@ func TestStreamAnthropicSoftDisconnectStillClosesEnvelope(t *testing.T) {
 		cancelAfter: 1,
 		cancel:      cancel,
 	}
-	_, err := streamAnthropicMessages(recorder, req, body, "msg_test", "grok", false, nil, 0)
+	_, _, err := streamAnthropicMessages(recorder, req, body, "msg_test", "grok", false, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

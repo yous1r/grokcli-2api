@@ -292,6 +292,7 @@ func (s *Service) maybeRun() {
 	s.mu.Lock()
 	s.last = result
 	s.mu.Unlock()
+	s.writeTaskLog(ctx, "background", result)
 }
 
 func (s *Service) RunOnce(ctx context.Context, source string) map[string]any {
@@ -528,6 +529,7 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 		"available", totalAvailable, "failed", totalFailed,
 		"covered", covered, "remaining", remaining, "elapsed_ms", result["elapsed_ms"],
 	)
+	s.writeTaskLog(ctx, source, result)
 	return result
 }
 
@@ -1281,6 +1283,47 @@ func cloneMap(in map[string]any) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+func (s *Service) writeTaskLog(ctx context.Context, source string, result map[string]any) {
+	if s == nil || s.Store == nil || result == nil {
+		return
+	}
+	// Skip pure lock-busy no-ops.
+	if result["deferred_busy"] == true {
+		return
+	}
+	probed := intOf(result["probed"])
+	if probed == 0 && intOf(result["count"]) == 0 && source == "background" {
+		return
+	}
+	okVal := result["ok"] != false
+	status := "done"
+	if result["ok"] == false {
+		status = "error"
+		okVal = false
+	} else if result["budget_hit"] == true || intOf(result["deferred"]) > 0 {
+		status = "partial"
+	}
+	summary := "模型探测[" + source + "]：可用 " + itoa(intOf(result["available_count"])) + "/" + itoa(intOf(result["count"]))
+	if intOf(result["kick_cooldown"])+intOf(result["kick_disabled"]) > 0 {
+		summary += " · 冷却踢出 " + itoa(intOf(result["kick_cooldown"])) + " · 禁用 " + itoa(intOf(result["kick_disabled"]))
+	}
+	if intOf(result["model_blocked_count"]) > 0 {
+		summary += " · 模型封禁 " + itoa(intOf(result["model_blocked_count"]))
+	}
+	detail := map[string]any{}
+	for _, k := range []string{"probed", "count", "available_count", "unavailable_count", "kick_cooldown", "kick_disabled", "model_blocked_count", "workers", "waves", "budget_hit", "models", "source", "elapsed_ms", "sweep"} {
+		if v, ok := result[k]; ok {
+			detail[k] = v
+		}
+	}
+	okPtr := okVal
+	_, _ = s.Store.WriteTask(ctx, "probe", status, summary, "probe:"+source, &okPtr, detail, intOf(result["available_count"]), intOf(result["count"]), true)
+}
+
+func itoa(n int) string {
+	return strconv.Itoa(n)
 }
 
 func isFreeUsageExhausted(errText string) bool {

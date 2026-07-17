@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"strings"
 	"time"
@@ -157,4 +158,34 @@ func boolPtr(ptr *bool) any {
 		return nil
 	}
 	return *ptr
+}
+
+// WriteTask inserts or updates a task_logs row (Python task_log.record parity).
+func (c *Connector) WriteTask(ctx context.Context, kind, status, summary, taskID string, ok *bool, detail map[string]any, progressDone, progressTotal int, finished bool) (int64, error) {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		kind = "task"
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "done"
+	}
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	detailBytes, err := json.Marshal(detail)
+	if err != nil {
+		return 0, err
+	}
+	var finishedAt *time.Time
+	if finished {
+		now := time.Now()
+		finishedAt = &now
+	}
+	var id int64
+	err = c.Pool.QueryRow(ctx, `
+		INSERT INTO task_logs (kind, task_id, status, summary, detail, ok, progress_done, progress_total, finished_at, updated_at)
+		VALUES ($1, NULLIF($2,''), $3, NULLIF($4,''), $5::jsonb, $6, $7, $8, $9::timestamptz, now())
+		RETURNING id`, kind, taskID, status, summary, detailBytes, ok, progressDone, progressTotal, finishedAt).Scan(&id)
+	return id, err
 }
