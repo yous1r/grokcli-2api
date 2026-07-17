@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const placeholderPrefix = "[compacted tool result"
@@ -604,4 +605,72 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// Outbound tool policy (Python history_compact.resolve_outbound_*).
+
+// IsOpenAINativeClient reports whether UA looks like Codex / OpenAI SDK rather
+// than Claude Code / Anthropic. Empty or unknown UA is conservative (false).
+func IsOpenAINativeClient(userAgent string) bool {
+	ua := strings.ToLower(strings.TrimSpace(userAgent))
+	if ua == "" {
+		return false
+	}
+	for _, marker := range []string{"claude-cli", "anthropic", "claude-code"} {
+		if strings.Contains(ua, marker) {
+			return false
+		}
+	}
+	for _, marker := range []string{
+		"codex", "openai/python", "openai-python", "openai/", "chatgpt", "gpt-agent", "responses-sdk",
+	} {
+		if strings.Contains(ua, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// OutboundToolPolicy is the resolved per-request tool emission policy.
+type OutboundToolPolicy struct {
+	MaxTools int           // 0 = unlimited
+	ToolGap  time.Duration // pause before consecutive tool frames
+}
+
+// ResolveOutboundMaxTools picks the per-turn tool cap.
+//
+//	chat/completions → maxToolsOpenAI (default 0 unlimited)
+//	responses + OpenAI-native UA → maxToolsResponsesNative
+//	else (anthropic / responses via sub2api / unknown) → maxToolsClaude
+func ResolveOutboundMaxTools(protocol, userAgent string, maxToolsClaude, maxToolsOpenAI, maxToolsResponsesNative int) int {
+	proto := strings.ToLower(strings.TrimSpace(protocol))
+	switch proto {
+	case "openai", "chat", "chat_completions", "openai_chat":
+		return maxToolsOpenAI
+	case "openai_responses", "responses":
+		if IsOpenAINativeClient(userAgent) {
+			return maxToolsResponsesNative
+		}
+	}
+	return maxToolsClaude
+}
+
+// ResolveOutboundToolGap picks wall-clock gap between outbound tool frames.
+func ResolveOutboundToolGap(protocol, userAgent string, gapClaude, gapNative time.Duration) time.Duration {
+	proto := strings.ToLower(strings.TrimSpace(protocol))
+	if proto == "openai" || proto == "chat" || proto == "chat_completions" || proto == "openai_chat" {
+		return gapNative
+	}
+	if IsOpenAINativeClient(userAgent) {
+		return gapNative
+	}
+	return gapClaude
+}
+
+// ResolveOutboundToolPolicy combines max tools + gap for a request.
+func ResolveOutboundToolPolicy(protocol, userAgent string, maxToolsClaude, maxToolsOpenAI, maxToolsResponsesNative int, gapClaude, gapNative time.Duration) OutboundToolPolicy {
+	return OutboundToolPolicy{
+		MaxTools: ResolveOutboundMaxTools(protocol, userAgent, maxToolsClaude, maxToolsOpenAI, maxToolsResponsesNative),
+		ToolGap:  ResolveOutboundToolGap(protocol, userAgent, gapClaude, gapNative),
+	}
 }

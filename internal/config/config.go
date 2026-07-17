@@ -50,14 +50,18 @@ type Config struct {
 	RegistrationMode       string
 	RegistrationServiceURL string
 	RegistrationToken      string
-	StaticDir              string
-	SSEKeepalive           time.Duration
-	RequestTimeout         time.Duration
-	OutboundMaxTools       int
-	Workers                int
-	MaintainerLeader       string
-	MaintainerLeaderTTL    time.Duration
-	MaintainerLeaderRenew  time.Duration
+	StaticDir                       string
+	SSEKeepalive                    time.Duration
+	RequestTimeout                  time.Duration
+	OutboundMaxTools                int
+	OutboundMaxToolsOpenAI          int
+	OutboundMaxToolsResponsesNative int
+	OutboundToolGap                 time.Duration
+	OutboundToolGapNative           time.Duration
+	Workers                         int
+	MaintainerLeader                string
+	MaintainerLeaderTTL             time.Duration
+	MaintainerLeaderRenew           time.Duration
 }
 
 func Load() (Config, error) {
@@ -114,6 +118,22 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	outboundMaxTools, err := envInt("GROK2API_OUTBOUND_MAX_TOOLS", 1, 0, 64)
+	if err != nil {
+		return Config{}, err
+	}
+	outboundMaxToolsOpenAI, err := envInt("GROK2API_OUTBOUND_MAX_TOOLS_OPENAI", 0, 0, 64)
+	if err != nil {
+		return Config{}, err
+	}
+	outboundMaxToolsResponsesNative, err := envInt("GROK2API_OUTBOUND_MAX_TOOLS_RESPONSES_NATIVE", 0, 0, 64)
+	if err != nil {
+		return Config{}, err
+	}
+	outboundToolGap, err := envSeconds("GROK2API_OUTBOUND_TOOL_GAP_SEC", 80*time.Millisecond, 0, 2*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	outboundToolGapNative, err := envSeconds("GROK2API_OUTBOUND_TOOL_GAP_SEC_NATIVE", 0, 0, 2*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
@@ -175,10 +195,14 @@ func Load() (Config, error) {
 		RegistrationServiceURL: strings.TrimRight(envString("GROK2API_REGISTRATION_SERVICE_URL", ""), "/"),
 		RegistrationToken:      envString("GROK2API_REGISTRATION_TOKEN", ""),
 		StaticDir:              envString("GROK2API_STATIC_DIR", defaultStaticDir),
-		SSEKeepalive:           keepalive,
-		RequestTimeout:         timeout,
-		OutboundMaxTools:       outboundMaxTools,
-		Workers:                workers,
+		SSEKeepalive:                    keepalive,
+		RequestTimeout:                  timeout,
+		OutboundMaxTools:                outboundMaxTools,
+		OutboundMaxToolsOpenAI:          outboundMaxToolsOpenAI,
+		OutboundMaxToolsResponsesNative: outboundMaxToolsResponsesNative,
+		OutboundToolGap:                 outboundToolGap,
+		OutboundToolGapNative:           outboundToolGapNative,
+		Workers:                         workers,
 		MaintainerLeader:       strings.ToLower(strings.TrimSpace(envString("GROK2API_MAINTAINER_LEADER", "auto"))),
 		MaintainerLeaderTTL:    leaderTTL,
 		MaintainerLeaderRenew:  leaderRenew,

@@ -47,13 +47,14 @@ services:
       # (compose network). Inline Turnstile Solver listens on container
       # loopback 127.0.0.1:5072 and is NOT published to the host.
       - "3000:3000"
+      - "40081:40081"
     shm_size: "1gb"
     security_opt:
       - seccomp:unconfined
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       GROK2API_HOST: "0.0.0.0"
-      GROK2API_PORT: "3000"
+      GROK2API_PORT: "40081"
       GROK2API_OPEN_BROWSER: "0"
       GROK2API_TOKEN_MAINTAIN: "1"
       GROK2API_MODEL_HEALTH: "1"

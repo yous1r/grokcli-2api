@@ -22,6 +22,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/server"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
+	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 	"github.com/hm2899/grokcli-2api/internal/upstream/oidc"
 )
 
@@ -135,6 +136,7 @@ func main() {
 		AdminSessions:     adminSessions,
 		PickObserver:      redis.NewPickObserver(redisClient),
 		AffinityStore:     redis.NewChatAffinity(redisClient, cfg.SSEKeepalive*1800),
+		Upstream:          &grok.Client{BaseURL: cfg.UpstreamBase},
 		Redis:             redisClient,
 		Leader:            leader,
 		Maintainer:        maintSvc,

@@ -322,16 +322,22 @@ func (c *Connector) UsageSummary(ctx context.Context, days int) (map[string]any,
 	if err != nil {
 		return nil, err
 	}
+	cache, err := c.usageCacheAggregate(ctx, days)
+	if err != nil {
+		// Non-fatal: page can still render request/token totals.
+		cache = map[string]any{"ok": false, "source": "postgres", "today": map[string]any{}, "window": map[string]any{}, "lifetime": map[string]any{}, "days": days}
+	}
 	return map[string]any{
-		"ok":       true,
-		"days":     days,
-		"today":    today.mapWithRate(),
-		"window":   window.mapWithRate(),
-		"lifetime": life.mapWithRate(),
-		"cache":    map[string]any{"ok": false, "source": "postgres", "today": map[string]any{}, "window": map[string]any{}, "lifetime": map[string]any{}, "days": days},
-		"series":   series["items"],
-		"source":   "postgres",
-		"light":    map[string]any{"today_requests": today.Requests, "today_tokens": today.TotalTokens, "total_tokens": life.TotalTokens},
+		"ok":           true,
+		"days":         days,
+		"today":        today.mapWithRate(),
+		"window":       window.mapWithRate(),
+		"lifetime":     life.mapWithRate(),
+		"cache":        cache,
+		"series":       series["items"],
+		"source":       "postgres",
+		"store_source": "postgres",
+		"light":        map[string]any{"today_requests": today.Requests, "today_tokens": today.TotalTokens, "total_tokens": life.TotalTokens},
 	}, nil
 }
 
@@ -357,7 +363,7 @@ func (c *Connector) UsageSeries(ctx context.Context, days int) (map[string]any, 
 		item["day"] = day.Format("2006-01-02")
 		items = append(items, item)
 	}
-	return map[string]any{"ok": true, "days": days, "items": items, "source": "postgres"}, rows.Err()
+	return map[string]any{"ok": true, "days": days, "items": items, "source": "postgres", "store_source": "postgres", "series": items}, rows.Err()
 }
 
 func (c *Connector) UsageBreakdown(ctx context.Context, dim string, days, limit int) (map[string]any, error) {
@@ -384,6 +390,7 @@ func (c *Connector) UsageBreakdown(ctx context.Context, dim string, days, limit 
 	}
 	defer rows.Close()
 	items := []map[string]any{}
+	ids := []string{}
 	for rows.Next() {
 		var id string
 		var totals usageTotals
@@ -395,8 +402,40 @@ func (c *Connector) UsageBreakdown(ctx context.Context, dim string, days, limit 
 		item["dim_id"] = id
 		item["dim"] = dim
 		items = append(items, item)
+		ids = append(ids, id)
 	}
-	return map[string]any{"ok": true, "dim": dim, "days": days, "items": items, "source": "postgres"}, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	switch dim {
+	case "key":
+		meta, _ := c.lookupAPIKeyMeta(ctx, ids)
+		for _, item := range items {
+			id, _ := item["id"].(string)
+			if m := meta[id]; m != nil {
+				item["name"] = m["name"]
+				item["prefix"] = m["prefix"]
+				if m["enabled"] != nil {
+					item["enabled"] = m["enabled"]
+				}
+				if m["lifetime_tokens"] != nil {
+					item["lifetime_tokens"] = m["lifetime_tokens"]
+				}
+			}
+		}
+	case "account":
+		meta, _ := c.lookupAccountMeta(ctx, ids)
+		for _, item := range items {
+			id, _ := item["id"].(string)
+			if m := meta[id]; m != nil {
+				item["email"] = m["email"]
+				if m["lifetime_tokens"] != nil {
+					item["lifetime_tokens"] = m["lifetime_tokens"]
+				}
+			}
+		}
+	}
+	return map[string]any{"ok": true, "dim": dim, "days": days, "items": items, "source": "postgres", "store_source": "postgres"}, nil
 }
 
 func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters map[string]string, okFlag *bool) (map[string]any, error) {
@@ -405,25 +444,41 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 	where := []string{}
 	args := []any{}
 	for _, field := range []string{"api_key_id", "account_id", "model", "protocol", "client_ip"} {
-		if value := strings.TrimSpace(filters[field]); value != "" {
-			args = append(args, value)
-			where = append(where, field+" = $"+itoaSQL(len(args)))
+		value := strings.TrimSpace(filters[field])
+		// Frontend sends protocol=all / ok=all sentinels; ignore them.
+		if value == "" || strings.EqualFold(value, "all") || value == "*" {
+			continue
 		}
+		args = append(args, value)
+		where = append(where, "e."+field+" = $"+itoaSQL(len(args)))
 	}
 	if q := strings.TrimSpace(filters["q"]); q != "" {
 		args = append(args, "%"+q+"%")
-		where = append(where, "(COALESCE(error,'') ILIKE $"+itoaSQL(len(args))+" OR COALESCE(path,'') ILIKE $"+itoaSQL(len(args))+" OR COALESCE(model,'') ILIKE $"+itoaSQL(len(args))+")")
+		n := itoaSQL(len(args))
+		where = append(where, "(COALESCE(e.error,'') ILIKE $"+n+
+			" OR COALESCE(e.path,'') ILIKE $"+n+
+			" OR COALESCE(e.model,'') ILIKE $"+n+
+			" OR COALESCE(e.protocol,'') ILIKE $"+n+
+			" OR COALESCE(e.client_ip,'') ILIKE $"+n+
+			" OR COALESCE(e.account_id,'') ILIKE $"+n+
+			" OR COALESCE(e.api_key_id,'') ILIKE $"+n+
+			" OR COALESCE(k.name,'') ILIKE $"+n+
+			" OR COALESCE(k.prefix,'') ILIKE $"+n+
+			" OR COALESCE(a.email,'') ILIKE $"+n+")")
 	}
 	if okFlag != nil {
 		args = append(args, *okFlag)
-		where = append(where, "ok = $"+itoaSQL(len(args)))
+		where = append(where, "e.ok = $"+itoaSQL(len(args)))
 	}
 	wh := ""
 	if len(where) > 0 {
 		wh = " WHERE " + strings.Join(where, " AND ")
 	}
 	var total int64
-	if err := c.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM usage_events"+wh, args...).Scan(&total); err != nil {
+	countSQL := `SELECT COUNT(*) FROM usage_events e
+		LEFT JOIN api_keys k ON k.id = e.api_key_id
+		LEFT JOIN accounts a ON a.id = e.account_id` + wh
+	if err := c.Pool.QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
 		return nil, err
 	}
 	totalPages := int(math.Max(1, math.Ceil(float64(total)/float64(pageSize))))
@@ -433,12 +488,15 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 	offset := (page - 1) * pageSize
 	queryArgs := append(append([]any{}, args...), pageSize, offset)
 	rows, err := c.Pool.Query(ctx, `
-		SELECT id, created_at, api_key_id, account_id, model, protocol, path, stream, ok,
-		       prompt_tokens, completion_tokens, total_tokens, cache_read_tokens,
-		       cache_creation_tokens, reasoning_tokens, client_ip, user_agent,
-		       status_code, latency_ms, ttft_ms, error, detail
-		FROM usage_events`+wh+`
-		ORDER BY created_at DESC, id DESC
+		SELECT e.id, e.created_at, e.api_key_id, e.account_id, e.model, e.protocol, e.path, e.stream, e.ok,
+		       e.prompt_tokens, e.completion_tokens, e.total_tokens, e.cache_read_tokens,
+		       e.cache_creation_tokens, e.reasoning_tokens, e.client_ip, e.user_agent,
+		       e.status_code, e.latency_ms, e.ttft_ms, e.error, e.detail,
+		       k.name, k.prefix, a.email
+		FROM usage_events e
+		LEFT JOIN api_keys k ON k.id = e.api_key_id
+		LEFT JOIN accounts a ON a.id = e.account_id`+wh+`
+		ORDER BY e.created_at DESC, e.id DESC
 		LIMIT $`+itoaSQL(len(args)+1)+` OFFSET $`+itoaSQL(len(args)+2), queryArgs...)
 	if err != nil {
 		return nil, err
@@ -453,7 +511,8 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 		var prompt, completion, totalTok, cacheRead, cacheCreate, reasoning int64
 		var statusCode, latency, ttft *int
 		var detail []byte
-		if scanErr := rows.Scan(&id, &createdAt, &apiKeyID, &accountID, &model, &protocol, &path, &stream, &okValue, &prompt, &completion, &totalTok, &cacheRead, &cacheCreate, &reasoning, &clientIP, &userAgent, &statusCode, &latency, &ttft, &errText, &detail); scanErr != nil {
+		var keyName, keyPrefix, accountEmail *string
+		if scanErr := rows.Scan(&id, &createdAt, &apiKeyID, &accountID, &model, &protocol, &path, &stream, &okValue, &prompt, &completion, &totalTok, &cacheRead, &cacheCreate, &reasoning, &clientIP, &userAgent, &statusCode, &latency, &ttft, &errText, &detail, &keyName, &keyPrefix, &accountEmail); scanErr != nil {
 			return nil, scanErr
 		}
 		items = append(items, map[string]any{
@@ -462,9 +521,120 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 			"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": totalTok, "cache_read_tokens": cacheRead,
 			"cache_creation_tokens": cacheCreate, "reasoning_tokens": reasoning, "client_ip": stringPtr(clientIP), "user_agent": stringPtr(userAgent),
 			"status_code": intPtr(statusCode), "latency_ms": intPtr(latency), "ttft_ms": intPtr(ttft), "error": stringPtr(errText), "detail": decodeMap(detail),
+			"api_key_name": stringPtr(keyName), "api_key_prefix": stringPtr(keyPrefix), "account_email": stringPtr(accountEmail),
 		})
 	}
-	return map[string]any{"ok": true, "items": items, "total": total, "page": page, "page_size": pageSize, "total_pages": totalPages, "source": "postgres"}, rows.Err()
+	return map[string]any{
+		"ok": true, "items": items, "total": total, "page": page, "page_size": pageSize,
+		"total_pages": totalPages, "source": "postgres", "store_source": "postgres",
+	}, rows.Err()
+}
+
+
+func (c *Connector) usageCacheAggregate(ctx context.Context, days int) (map[string]any, error) {
+	days = clamp(days, 1, 90, 7)
+	empty := map[string]any{
+		"prompt_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0,
+		"ok_requests": 0, "cache_hit_requests": 0, "token_hit_ratio": nil, "request_hit_ratio": nil,
+	}
+	out := map[string]any{"ok": true, "source": "postgres", "today": cloneAnyMap(empty), "window": cloneAnyMap(empty), "lifetime": cloneAnyMap(empty), "days": days}
+	scanBucket := func(query string, args ...any) (map[string]any, error) {
+		var prompt, cacheRead, cacheCreate, okReq, hitReq int64
+		if err := c.Pool.QueryRow(ctx, query, args...).Scan(&prompt, &cacheRead, &cacheCreate, &okReq, &hitReq); err != nil {
+			return cloneAnyMap(empty), err
+		}
+		bucket := map[string]any{
+			"prompt_tokens": prompt, "cache_read_tokens": cacheRead, "cache_creation_tokens": cacheCreate,
+			"ok_requests": okReq, "cache_hit_requests": hitReq, "token_hit_ratio": nil, "request_hit_ratio": nil,
+		}
+		if prompt > 0 {
+			bucket["token_hit_ratio"] = math.Round(10000*float64(cacheRead)/float64(prompt)) / 100
+		}
+		if okReq > 0 {
+			bucket["request_hit_ratio"] = math.Round(10000*float64(hitReq)/float64(okReq)) / 100
+		}
+		return bucket, nil
+	}
+	const base = `
+		SELECT
+		  COALESCE(SUM(prompt_tokens), 0),
+		  COALESCE(SUM(cache_read_tokens), 0),
+		  COALESCE(SUM(cache_creation_tokens), 0),
+		  COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE AND cache_read_tokens > 0), 0)
+		FROM usage_events`
+	life, err := scanBucket(base)
+	if err != nil {
+		return out, err
+	}
+	out["lifetime"] = life
+	today, err := scanBucket(base + ` WHERE created_at >= date_trunc('day', now())`)
+	if err != nil {
+		return out, err
+	}
+	out["today"] = today
+	window, err := scanBucket(base+` WHERE created_at >= date_trunc('day', now()) - (($1::int - 1) * INTERVAL '1 day')`, days)
+	if err != nil {
+		return out, err
+	}
+	out["window"] = window
+	return out, nil
+}
+
+func (c *Connector) lookupAPIKeyMeta(ctx context.Context, ids []string) (map[string]map[string]any, error) {
+	out := map[string]map[string]any{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := c.Pool.Query(ctx, `SELECT id, name, prefix, enabled, COALESCE(total_tokens_total, 0) FROM api_keys WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, name, prefix string
+		var enabled bool
+		var lifetime int64
+		if err := rows.Scan(&id, &name, &prefix, &enabled, &lifetime); err != nil {
+			return out, err
+		}
+		out[id] = map[string]any{"name": name, "prefix": prefix, "enabled": enabled, "lifetime_tokens": lifetime}
+	}
+	return out, rows.Err()
+}
+
+func (c *Connector) lookupAccountMeta(ctx context.Context, ids []string) (map[string]map[string]any, error) {
+	out := map[string]map[string]any{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := c.Pool.Query(ctx, `
+		SELECT a.id, a.email, COALESCE(ap.total_tokens_total, 0)
+		FROM accounts a
+		LEFT JOIN account_pool ap ON ap.account_id = a.id
+		WHERE a.id = ANY($1)`, ids)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var email *string
+		var lifetime int64
+		if err := rows.Scan(&id, &email, &lifetime); err != nil {
+			return out, err
+		}
+		out[id] = map[string]any{"email": stringPtr(email), "lifetime_tokens": lifetime}
+	}
+	return out, rows.Err()
+}
+
+func cloneAnyMap(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	return out
 }
 
 func (c *Connector) usageRange(ctx context.Context, days int) (usageTotals, error) {

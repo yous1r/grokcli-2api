@@ -31,7 +31,7 @@ func TestBuildChatBodyConvertsResponsesInput(t *testing.T) {
 }
 
 func TestBuildObjectConvertsChatResult(t *testing.T) {
-	obj := BuildObject("resp_1", "grok", "hello", "plan", []map[string]any{{"id": "call_1", "function": map[string]any{"name": "Edit", "arguments": `{"file_path":"/x"}`}}}, map[string]any{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}, 123, "resp_0", map[string]any{"a": "b"})
+	obj := BuildObject("resp_1", "grok", "hello", "plan", []map[string]any{{"id": "call_1", "function": map[string]any{"name": "Edit", "arguments": "{\"file_path\":\"/x\"}"}}}, map[string]any{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}, 123, "resp_0", map[string]any{"a": "b"})
 	if obj["id"] != "resp_1" || obj["status"] != "completed" || obj["previous_response_id"] != "resp_0" {
 		t.Fatalf("unexpected object %#v", obj)
 	}
@@ -47,5 +47,25 @@ func TestBuildObjectConvertsChatResult(t *testing.T) {
 	usage := obj["usage"].(map[string]any)
 	if usage["input_tokens"] != 2 || usage["output_tokens"] != 3 || usage["total_tokens"] != 5 {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestInputToMessagesFlattensInputTextParts(t *testing.T) {
+	messages := InputToMessages([]any{
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "hi"},
+			},
+		},
+	}, "be useful")
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	if messages[0]["role"] != "system" || messages[0]["content"] != "be useful" {
+		t.Fatalf("system = %#v", messages[0])
+	}
+	if messages[1]["role"] != "user" || messages[1]["content"] != "hi" {
+		t.Fatalf("user content not flattened: %#v", messages[1])
 	}
 }

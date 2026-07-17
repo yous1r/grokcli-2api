@@ -26,6 +26,7 @@ var unsupportedUpstreamParams = map[string]bool{
 	"logprobs":                 true,
 	"top_logprobs":             true,
 	"n":                        true,
+	// Python oracle strips public prompt_cache_* before upstream; affinity uses private copies.
 	"prompt_cache_key":         true,
 	"prompt_cache_retention":   true,
 	"_history_compact":         true,
@@ -61,8 +62,6 @@ func SanitizeUpstreamBody(body map[string]any) map[string]any {
 	return out
 }
 
-// StabilizePromptBody canonicalizes tools/messages formatting so multi-turn
-// prompt prefixes stay byte-stable (mirrors Python _stabilize_upstream_prompt_body).
 func StabilizePromptBody(body map[string]any) map[string]any {
 	if body == nil {
 		return map[string]any{"messages_stabilized": 0, "tools_stabilized": 0}
@@ -212,6 +211,8 @@ func stabilizeMessage(msg map[string]any) (map[string]any, int) {
 		}
 	case string:
 		out["content"] = stabilizeTextContent(content, role)
+	case []any:
+		out["content"] = stabilizeContentParts(content, role)
 	default:
 		out["content"] = content
 	}
@@ -219,6 +220,54 @@ func stabilizeMessage(msg map[string]any) (map[string]any, int) {
 		out["reasoning_content"] = rc
 	}
 	return out, canonCount
+}
+
+func stabilizeContentParts(parts []any, role string) any {
+	out := make([]any, 0, len(parts))
+	textOnly := make([]string, 0, len(parts))
+	anyNonText := false
+	for _, part := range parts {
+		switch item := part.(type) {
+		case string:
+			if item == "" {
+				continue
+			}
+			textOnly = append(textOnly, item)
+			out = append(out, map[string]any{"type": "text", "text": item})
+		case map[string]any:
+			typeName := strings.ToLower(stringFromAny(firstNonNil(item["type"], "text")))
+			switch typeName {
+			case "text", "input_text", "output_text":
+				text := stringFromAny(firstNonNil(item["text"], item["content"]))
+				if text == "" {
+					continue
+				}
+				textOnly = append(textOnly, text)
+				out = append(out, map[string]any{"type": "text", "text": text})
+			case "image_url", "image", "input_image":
+				anyNonText = true
+				out = append(out, item)
+			default:
+				if text := stringFromAny(firstNonNil(item["text"], item["content"])); text != "" {
+					textOnly = append(textOnly, text)
+					out = append(out, map[string]any{"type": "text", "text": text})
+				} else {
+					anyNonText = true
+					out = append(out, item)
+				}
+			}
+		default:
+			anyNonText = true
+			out = append(out, part)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	if !anyNonText {
+		return stabilizeTextContent(strings.Join(textOnly, "\n"), role)
+	}
+	return out
 }
 
 func stabilizeTextContent(text, role string) string {

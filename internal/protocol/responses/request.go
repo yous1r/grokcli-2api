@@ -121,6 +121,11 @@ func InputToMessages(rawInput any, instructions string) []map[string]any {
 			if content == nil && entry["text"] != nil {
 				content = stringValue(entry["text"])
 			}
+			// sub2api OpenAI test / Responses clients send:
+			//   content: [{type:"input_text", text:"hi"}]
+			// Upstream cli-chat-proxy rejects those parts as "Empty content block".
+			// Flatten to OpenAI chat multimodal/text shape (Python parity).
+			content = normalizeMessageContent(content)
 			msg := map[string]any{"role": role, "content": content}
 			if calls, ok := entry["tool_calls"].([]any); ok && len(calls) > 0 {
 				msg["tool_calls"] = calls
@@ -132,6 +137,95 @@ func InputToMessages(rawInput any, instructions string) []map[string]any {
 		}
 	}
 	return messages
+}
+
+// normalizeMessageContent converts Responses content parts into chat.completions
+// content. Text-only input_text/output_text/text parts become a plain string so
+// upstream does not see empty/unknown content blocks.
+func normalizeMessageContent(content any) any {
+	switch value := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	case []any:
+		return multimodalContentFromParts(value)
+	case map[string]any:
+		typeName := strings.ToLower(stringValue(firstNonNil(value["type"], "text")))
+		if typeName == "text" || typeName == "input_text" || typeName == "output_text" {
+			return stringValue(value["text"])
+		}
+		if value["text"] != nil {
+			return stringValue(value["text"])
+		}
+		return stringify(value)
+	default:
+		return stringify(value)
+	}
+}
+
+func multimodalContentFromParts(parts []any) any {
+	out := make([]any, 0, len(parts))
+	textOnly := make([]string, 0, len(parts))
+	anyNonText := false
+	for _, part := range parts {
+		switch item := part.(type) {
+		case string:
+			if item == "" {
+				continue
+			}
+			textOnly = append(textOnly, item)
+			out = append(out, map[string]any{"type": "text", "text": item})
+		case map[string]any:
+			typeName := strings.ToLower(stringValue(item["type"]))
+			switch typeName {
+			case "input_text", "output_text", "text", "":
+				text := stringValue(item["text"])
+				// Keep empty text only when it is the sole part; otherwise drop noise.
+				textOnly = append(textOnly, text)
+				out = append(out, map[string]any{"type": "text", "text": text})
+			case "input_image", "image", "image_url":
+				anyNonText = true
+				imageURL := firstNonNil(item["image_url"], item["url"], item["image"])
+				if url, ok := imageURL.(string); ok && url != "" {
+					out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+				} else if urlMap, ok := imageURL.(map[string]any); ok {
+					out = append(out, map[string]any{"type": "image_url", "image_url": urlMap})
+				} else {
+					out = append(out, cloneMap(item))
+				}
+			default:
+				if item["text"] != nil {
+					text := stringValue(item["text"])
+					textOnly = append(textOnly, text)
+					out = append(out, map[string]any{"type": "text", "text": text})
+				} else {
+					anyNonText = true
+					out = append(out, cloneMap(item))
+				}
+			}
+		default:
+			if text := strings.TrimSpace(fmt.Sprint(item)); text != "" && text != "<nil>" {
+				textOnly = append(textOnly, text)
+				out = append(out, map[string]any{"type": "text", "text": text})
+			}
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	if !anyNonText {
+		return strings.Join(textOnly, "")
+	}
+	return out
+}
+
+func cloneMap(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 func ConvertTools(raw any) []any {

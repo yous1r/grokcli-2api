@@ -65,6 +65,18 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.OutboundMaxTools != 1 {
 		t.Fatalf("outbound max tools default = %d", cfg.OutboundMaxTools)
 	}
+	if cfg.OutboundMaxToolsOpenAI != 0 {
+		t.Fatalf("openai max tools default = %d", cfg.OutboundMaxToolsOpenAI)
+	}
+	if cfg.OutboundMaxToolsResponsesNative != 0 {
+		t.Fatalf("responses native max tools default = %d", cfg.OutboundMaxToolsResponsesNative)
+	}
+	if cfg.OutboundToolGap != 80*time.Millisecond {
+		t.Fatalf("tool gap default = %s", cfg.OutboundToolGap)
+	}
+	if cfg.OutboundToolGapNative != 0 {
+		t.Fatalf("native tool gap default = %s", cfg.OutboundToolGapNative)
+	}
 }
 
 func TestLoadAliasesAndOverrides(t *testing.T) {

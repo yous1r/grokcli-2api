@@ -375,7 +375,9 @@ func userContentToOpenAI(content any) any {
 			blockType := strings.ToLower(stringValue(firstNonNil(block["type"], "text")))
 			switch blockType {
 			case "text", "input_text":
-				parts = append(parts, map[string]any{"type": "text", "text": stringValue(block["text"])})
+				if text := firstNonEmptyString(block["text"], block["content"]); text != "" {
+					parts = append(parts, map[string]any{"type": "text", "text": text})
+				}
 			case "image":
 				if image := imageToOpenAI(block); image != nil {
 					hasNonText = true

@@ -99,12 +99,45 @@ func TestPrepareUpstreamBodyStripsPrivateKeys(t *testing.T) {
 		"_history_compact": map[string]any{"applied": true},
 		"prompt_cache_key": "x",
 	})
-	if out["prompt_cache_key"] != nil || out["_history_compact"] != nil || out["_prompt_stabilize"] != nil {
+	if out["_history_compact"] != nil || out["_prompt_stabilize"] != nil {
 		t.Fatalf("private keys leaked: %#v", out)
+	}
+	if out["prompt_cache_key"] != nil {
+		t.Fatalf("prompt_cache_key should be stripped before upstream: %#v", out)
 	}
 	tools := out["tools"].([]any)
 	fn := tools[0].(map[string]any)["function"].(map[string]any)
 	if fn["parameters"] == nil {
 		t.Fatalf("parameters missing: %#v", tools)
+	}
+}
+
+func TestSanitizeUpstreamBodyDropsPromptCacheKey(t *testing.T) {
+	out := SanitizeUpstreamBody(map[string]any{
+		"messages":               []any{map[string]any{"role": "user", "content": "hi"}},
+		"prompt_cache_key":       "019f668b-9052-7842-ae62-12580fdf5005",
+		"prompt_cache_retention": "session",
+		"presence_penalty":       0.5,
+	})
+	if out["prompt_cache_key"] != nil {
+		t.Fatalf("prompt_cache_key should be stripped: %#v", out)
+	}
+	if out["prompt_cache_retention"] != nil {
+		t.Fatalf("prompt_cache_retention should be stripped: %#v", out)
+	}
+	if out["presence_penalty"] != nil {
+		t.Fatalf("unsupported field leaked: %#v", out)
+	}
+}
+
+func TestSanitizeUpstreamBodyPromptCacheKeyAbsent(t *testing.T) {
+	out := SanitizeUpstreamBody(map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if _, ok := out["prompt_cache_key"]; ok {
+		t.Fatalf("prompt_cache_key should not be present: %#v", out)
+	}
+	if _, ok := out["prompt_cache_retention"]; ok {
+		t.Fatalf("prompt_cache_retention should not be present: %#v", out)
 	}
 }

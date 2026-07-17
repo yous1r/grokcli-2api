@@ -3,6 +3,8 @@ package maintainer
 import (
 	"context"
 	"log/slog"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,9 +38,9 @@ func New(store *postgres.Connector, redisClient *redis.Client, oidcClient *oidc.
 		Store:    store,
 		Redis:    redisClient,
 		OIDC:     oidcClient,
-		Interval: 90 * time.Second,
-		Batch:    40,
-		Skew:     2 * time.Minute,
+		Interval: envDurationSec("GROK2API_TOKEN_MAINTAIN_INTERVAL", 60*time.Second, 5*time.Second, 30*time.Minute),
+		Batch:    envInt("GROK2API_TOKEN_REFRESH_BATCH", 50, 1, 500),
+		Skew:     envDurationSec("GROK2API_TOKEN_REFRESH_SKEW", 180*time.Second, 30*time.Second, 2*time.Hour),
 		Enabled:  func() bool { return true },
 		IsLeader: func() bool { return true },
 		stop:     make(chan struct{}),
@@ -82,21 +84,58 @@ func (s *Service) RequestRunSoon(force bool) {
 
 func (s *Service) Status() map[string]any {
 	if s == nil {
-		return map[string]any{"enabled": false, "implementation": "go", "started": false}
+		return map[string]any{"enabled": false, "implementation": "go", "started": false, "running": false}
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := map[string]any{}
+	lastCopy := map[string]any{}
 	for k, v := range s.last {
-		out[k] = v
+		lastCopy[k] = v
 	}
-	out["enabled"] = s.Enabled == nil || s.Enabled()
-	out["started"] = s.started
-	out["implementation"] = "go"
-	out["interval_sec"] = s.Interval.Seconds()
-	out["batch"] = s.Batch
-	out["is_leader"] = s.IsLeader == nil || s.IsLeader()
+	started := s.started
+	interval := s.Interval
+	batch := s.Batch
+	skew := s.Skew
+	s.mu.Unlock()
+
+	enabled := s.Enabled == nil || s.Enabled()
+	isLeader := s.IsLeader == nil || s.IsLeader()
+	running := started && enabled && isLeader
+	out := map[string]any{
+		"enabled":            enabled,
+		"started":            started,
+		"running":            running,
+		"local_running":      running,
+		"cluster_running":    running,
+		"leader_running":     running,
+		"implementation":     "go",
+		"interval_sec":       interval.Seconds(),
+		"next_wait_sec":      interval.Seconds(),
+		"batch":              batch,
+		"refresh_batch":      batch,
+		"adaptive_batch":     batch,
+		"refresh_skew_sec":   skew.Seconds(),
+		"background_skew_sec": skew.Seconds(),
+		"is_leader":          isLeader,
+		"last":               lastCopy,
+	}
+	if rem, ok := s.computeMinRemainingSec(context.Background()); ok {
+		out["min_remaining_sec"] = rem
+		lastCopy["min_remaining_sec"] = rem
+		out["last"] = lastCopy
+	}
 	return out
+}
+
+func (s *Service) enrichStatusMinRemaining(out map[string]any) {
+	rem, ok := s.computeMinRemainingSec(context.Background())
+	if !ok {
+		return
+	}
+	out["min_remaining_sec"] = rem
+	if last, ok := out["last"].(map[string]any); ok {
+		last["min_remaining_sec"] = rem
+		out["last"] = last
+	}
 }
 
 func (s *Service) loop() {
@@ -257,6 +296,11 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 		_, _ = s.Store.ClearAccountCooldown(ctx, newID)
 		refreshed++
 	}
+	if rem, ok := s.computeMinRemainingSec(ctx); ok {
+		result["min_remaining_sec"] = rem
+	}
+	result["next_wait_sec"] = s.Interval.Seconds()
+	result["adaptive"] = map[string]any{"batch": batch, "skew_sec": skew.Seconds()}
 	result["refresh"] = map[string]any{
 		"attempted":     len(candidates),
 		"refreshed":     refreshed,
@@ -303,4 +347,67 @@ func truthy(v any) bool {
 	default:
 		return false
 	}
+}
+
+
+func (s *Service) computeMinRemainingSec(ctx context.Context) (float64, bool) {
+	if s == nil || s.Store == nil {
+		return 0, false
+	}
+	rows, err := s.Store.ListRefreshableAccounts(ctx, 200)
+	if err != nil || len(rows) == 0 {
+		return 0, false
+	}
+	now := float64(time.Now().Unix())
+	minRem := 0.0
+	found := false
+	for _, row := range rows {
+		exp := accounts.ParseExpiresAt(row.Payload["expires_at"], stringFrom(row.Payload, "key"))
+		if exp == nil {
+			continue
+		}
+		rem := *exp - now
+		if !found || rem < minRem {
+			minRem = rem
+			found = true
+		}
+	}
+	return minRem, found
+}
+
+func envDurationSec(name string, fallback, min, max time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	sec, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fallback
+	}
+	d := time.Duration(sec * float64(time.Second))
+	if d < min {
+		return min
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
+func envInt(name string, fallback, min, max int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	if n < min {
+		return min
+	}
+	if n > max {
+		return max
+	}
+	return n
 }

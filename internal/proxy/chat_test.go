@@ -358,10 +358,10 @@ func TestPrepareUpstreamBodyStabilizesTools(t *testing.T) {
 			map[string]any{"name": "Write", "input_schema": map[string]any{"type": "object"}},
 			map[string]any{"name": "Edit", "input_schema": map[string]any{"type": "object"}},
 		},
-		"prompt_cache_key": "should-strip",
+		"prompt_cache_key": "should-forward",
 	})
 	if body["prompt_cache_key"] != nil {
-		t.Fatalf("prompt_cache_key should be stripped: %#v", body["prompt_cache_key"])
+		t.Fatalf("prompt_cache_key should be stripped before upstream: %#v", body["prompt_cache_key"])
 	}
 	tools := body["tools"].([]any)
 	first := tools[0].(map[string]any)["function"].(map[string]any)
@@ -451,4 +451,25 @@ func TestPrepareChainCapsFailover(t *testing.T) {
 	if len(chain) != defaultFailoverChain {
 		t.Fatalf("chain len=%d want %d", len(chain), defaultFailoverChain)
 	}
+}
+
+func TestGuardStreamAgainstEmptySlowFirstTokenPasses(t *testing.T) {
+	// Slow TTFT: no frames within the 1s peek window must NOT be treated as empty.
+	pr, pw := io.Pipe()
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n"))
+		_ = pw.Close()
+	}()
+	guarded, empty, err := guardStreamAgainstEmpty(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty {
+		t.Fatalf("slow first token must not be treated as empty")
+	}
+	if guarded == nil {
+		t.Fatal("expected reader")
+	}
+	_ = guarded.Close()
 }

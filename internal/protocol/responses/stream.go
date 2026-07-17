@@ -30,6 +30,8 @@ type LiveStreamer struct {
 	responseID    string
 	model         string
 	allowed       []string
+	maxTools      int
+	toolsStarted  int
 	sequence      Sequence
 	started       bool
 	closed        bool
@@ -44,10 +46,17 @@ type LiveStreamer struct {
 }
 
 func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
+	return NewLiveStreamerWithMaxTools(responseID, model, allowed, 0)
+}
+
+// NewLiveStreamerWithMaxTools caps outbound function_call items per turn.
+// maxTools <= 0 means unlimited (Codex / OpenAI-native).
+func NewLiveStreamerWithMaxTools(responseID, model string, allowed []string, maxTools int) *LiveStreamer {
 	return &LiveStreamer{
 		responseID: responseID,
 		model:      model,
 		allowed:    append([]string(nil), allowed...),
+		maxTools:   maxTools,
 		messageID:  "msg_" + responseID,
 		tools:      make(map[int]*liveTool),
 	}
@@ -184,7 +193,11 @@ func (s *LiveStreamer) ToolDeltas(deltas []ToolDelta) []string {
 		if state.emitted || state.name == "" || !toolcall.CompleteJSON(state.arguments, state.name) {
 			continue
 		}
+		if s.maxTools > 0 && s.toolsStarted >= s.maxTools {
+			break
+		}
 		state.emitted = true
+		s.toolsStarted++
 		state.output = s.output
 		state.itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
 		frames = append(frames,
