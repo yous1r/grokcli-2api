@@ -64,13 +64,13 @@ type Options struct {
 	AffinityStore proxy.AffinityStore
 	// Upstream is a shared Grok HTTP client (connection pool). Prefer this over
 	// constructing a new client on every request.
-	Upstream          *grok.Client
-	Redis             *redis.Client
-	Leader            *redis.Leader
-	Maintainer        *maintainer.Service
-	ModelHealth       *modelhealth.Service
-	Quota             *quota.Service
-	Config            config.Config
+	Upstream    *grok.Client
+	Redis       *redis.Client
+	Leader      *redis.Leader
+	Maintainer  *maintainer.Service
+	ModelHealth *modelhealth.Service
+	Quota       *quota.Service
+	Config      config.Config
 	// RuntimeConfig is the live process config. When non-nil, request handlers
 	// read streaming/tool policy from it so admin settings writes take effect
 	// without restart. Config remains the startup snapshot.
@@ -78,7 +78,6 @@ type Options struct {
 	RegistrationURL   string
 	RegistrationToken string
 }
-
 
 func (o Options) runtimeConfig() config.Config {
 	if o.RuntimeConfig != nil {
@@ -2638,7 +2637,6 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	return openAIUsage, firstTokenMS, err
 }
 
-
 // isSoftClientWriteError reports client-side stream aborts that should still run
 // Finish/Complete so Claude Code / Codex leave "running" instead of hanging as
 // "Tool use interrupted" on a half-open tool block.
@@ -3305,17 +3303,17 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 	// Always include pool as a plain map so chips/overview match DB even if
 	// AccountList.Pool pointer encoding is stripped by proxies/older clients.
 	payload := map[string]any{
-		"accounts":        result.Accounts,
-		"total":           result.Total,
-		"page":            result.Page,
-		"page_size":       result.PageSize,
-		"total_pages":     result.TotalPages,
-		"q":               result.Query,
-		"sort":            result.Sort,
-		"status":          result.Status,
-		"store_source":    result.StoreSource,
-		"store_backend":   result.StoreBackend,
-		"auth_file_role":  result.AuthFileRole,
+		"accounts":       result.Accounts,
+		"total":          result.Total,
+		"page":           result.Page,
+		"page_size":      result.PageSize,
+		"total_pages":    result.TotalPages,
+		"q":              result.Query,
+		"sort":           result.Sort,
+		"status":         result.Status,
+		"store_source":   result.StoreSource,
+		"store_backend":  result.StoreBackend,
+		"auth_file_role": result.AuthFileRole,
 	}
 	if result.HasSSO != nil {
 		payload["has_sso"] = *result.HasSSO

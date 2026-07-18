@@ -196,7 +196,6 @@ func TestStreamUpdateHeldTextDoesNotBlockTool(t *testing.T) {
 	}
 }
 
-
 func TestStreamDoesNotEmitPathOldWithoutNewStringUntilFinish(t *testing.T) {
 	// Mid-stream path+old must NOT emit tool_use; only Finish (coerce) may.
 	a := NewStreamAssembler("m", "g", true, 1, []string{"Edit"})
@@ -218,7 +217,6 @@ func TestStreamDoesNotEmitPathOldWithoutNewStringUntilFinish(t *testing.T) {
 		t.Fatalf("expected new_string b in:\n%s", joined)
 	}
 }
-
 
 func TestStreamUpdatePathOldDoesNotEmitUntilFinish(t *testing.T) {
 	// Mid-stream path+old without new_string must stay pending (not emit delete-match).

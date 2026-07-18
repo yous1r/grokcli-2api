@@ -297,7 +297,6 @@ func TestApplyPatchInputRequired(t *testing.T) {
 	}
 }
 
-
 func TestApplyPatchAliasShapes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -949,7 +948,6 @@ func TestUpdateAlternateAliases(t *testing.T) {
 	}
 }
 
-
 func TestMidStreamPathOldDoesNotComplete(t *testing.T) {
 	// Regression: stream often delivers path+old first, then replace later.
 	// CompleteJSON/EffectiveJSON must stay incomplete so Claude Code does not
@@ -1139,4 +1137,3 @@ func TestMergeDoesNotInventNewStringMidStream(t *testing.T) {
 		t.Fatalf("new_string=%#v want y in %s", obj["new_string"], got)
 	}
 }
-

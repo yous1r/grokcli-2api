@@ -597,15 +597,16 @@ func (c *Connector) KickFromPool(ctx context.Context, accountID, reason string, 
 	return c.SetAccountEnabled(ctx, accountID, false)
 }
 
-
 // SetAccountPoolStatus manually sets the admin pool tag (writes account_pool).
 // Supported status values (aliases accepted):
-//   live|normal  — re-enter rotation (clears cool/quota/model-block/disabled)
-//   cooldown     — durable cool; optional cooldown_sec (default 7200)
-//   model_blocked— soft-block model (optional model, default "manual"); optional cooldown_sec as until
-//   quota_disabled — out of rotation for quota
-//   disabled     — manual disable
-//   expired      — mark expired (out of rotation)
+//
+//	live|normal  — re-enter rotation (clears cool/quota/model-block/disabled)
+//	cooldown     — durable cool; optional cooldown_sec (default 7200)
+//	model_blocked— soft-block model (optional model, default "manual"); optional cooldown_sec as until
+//	quota_disabled — out of rotation for quota
+//	disabled     — manual disable
+//	expired      — mark expired (out of rotation)
+//
 // Reason is stored in last_error / cooldown_reason / disabled_reason as appropriate.
 func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status, reason, model string, cooldownSec *float64) (map[string]any, error) {
 	c.InvalidateCandidateCache()

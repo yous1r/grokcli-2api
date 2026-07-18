@@ -1000,7 +1000,6 @@ func decodeObjectPairs(text string) ([]objectPair, error) {
 	return pairs, nil
 }
 
-
 // marshalNoHTML encodes a single JSON value without HTML escaping so shell
 // args keep raw & < > (json.Marshal rewrites them as \u0026 / \u003c / \u003e).
 func marshalNoHTML(value any) ([]byte, error) {

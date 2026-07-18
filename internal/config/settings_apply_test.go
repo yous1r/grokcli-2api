@@ -41,7 +41,7 @@ func TestApplyStoreSettingsIgnoresInvalid(t *testing.T) {
 	cfg := Config{DefaultModel: "keep", SSEKeepalive: 4 * time.Second, OutboundMaxTools: 1}
 	cfg.ApplyStoreSettings(map[string]any{
 		"default_model":      "   ",
-		"sse_keepalive":      float64(1), // below min
+		"sse_keepalive":      float64(1),  // below min
 		"outbound_max_tools": float64(99), // above max
 	})
 	if cfg.DefaultModel != "keep" {

@@ -756,7 +756,6 @@ func preferredShellArgKey(name string, keys map[string]string) string {
 	return ""
 }
 
-
 // extractAllowedToolNames collects client-registered tool names from OpenAI or
 // Anthropic-shaped tools arrays. Used to remap Grok Update/StrReplace → Edit.
 func extractAllowedToolNames(raw map[string]any) []string {

@@ -542,23 +542,21 @@ func (c *Connector) GetSetting(ctx context.Context, key string) (any, error) {
 	return decoded, nil
 }
 
-
-
 // defaultPoolPolicy mirrors Python account_pool.cooldown_defaults /
 // settings_store.get_pool_policy so admin UI always has numbers to show.
 func defaultPoolPolicy() map[string]any {
 	return map[string]any{
-		"cooldown_default_sec":         float64(20),
-		"cooldown_auth_sec":            float64(90),
-		"cooldown_rate_limit_sec":      float64(45),
-		"cooldown_server_error_sec":    float64(20),
-		"cooldown_max_sec":             float64(600),
-		"soft_model_block_ttl_sec":     float64(180),
-		"durable_model_block_ttl_sec":  float64(3600),
-		"probe_fail_kick_streak":       int64(2),
-		"probe_fail_disable_streak":    int64(4),
-		"probe_kick_cooldown_sec":      float64(600),
-		"max_failover_attempts":        int64(4),
+		"cooldown_default_sec":        float64(20),
+		"cooldown_auth_sec":           float64(90),
+		"cooldown_rate_limit_sec":     float64(45),
+		"cooldown_server_error_sec":   float64(20),
+		"cooldown_max_sec":            float64(600),
+		"soft_model_block_ttl_sec":    float64(180),
+		"durable_model_block_ttl_sec": float64(3600),
+		"probe_fail_kick_streak":      int64(2),
+		"probe_fail_disable_streak":   int64(4),
+		"probe_kick_cooldown_sec":     float64(600),
+		"max_failover_attempts":       int64(4),
 	}
 }
 

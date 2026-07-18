@@ -549,7 +549,6 @@ func TestStreamAnthropicSoftDisconnectStillClosesEnvelope(t *testing.T) {
 	}
 }
 
-
 func TestStreamAnthropicToolUseAtomicOnSoftDisconnect(t *testing.T) {
 	// tool_use start/delta/stop must land as a complete group even when the client
 	// soft-disconnects right after the upstream tool chunk (Claude Code "Tool use interrupted").
@@ -625,7 +624,6 @@ func TestStreamChatCompletionsForceFinishOnSoftDisconnect(t *testing.T) {
 		t.Fatalf("want single [DONE], got %d in %q", strings.Count(out, "data: [DONE]"), out)
 	}
 }
-
 
 type cancelAfterChunk struct {
 	chunks      []string

@@ -308,7 +308,6 @@ func envSeconds(name string, fallback, minimum, maximum time.Duration) (time.Dur
 	return value, nil
 }
 
-
 // ApplyStoreSettings overlays durable app_settings values onto the process config.
 // Only keys that affect live request routing / streaming are applied; maintainer
 // enable flags are read dynamically via PublicSettings and are not required here.

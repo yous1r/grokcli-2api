@@ -13,21 +13,21 @@ import (
 )
 
 type AccountList struct {
-	Accounts     []map[string]any `json:"accounts"`
-	IDs          []string         `json:"ids,omitempty"`
-	Total        int64            `json:"total"`
-	Page         int              `json:"page"`
-	PageSize     int              `json:"page_size"`
-	TotalPages   int              `json:"total_pages"`
-	Query        string           `json:"q"`
-	Sort         string           `json:"sort"`
-	Status       string           `json:"status,omitempty"`
-	HasSSO       *bool            `json:"has_sso,omitempty"`
+	Accounts   []map[string]any `json:"accounts"`
+	IDs        []string         `json:"ids,omitempty"`
+	Total      int64            `json:"total"`
+	Page       int              `json:"page"`
+	PageSize   int              `json:"page_size"`
+	TotalPages int              `json:"total_pages"`
+	Query      string           `json:"q"`
+	Sort       string           `json:"sort"`
+	Status     string           `json:"status,omitempty"`
+	HasSSO     *bool            `json:"has_sso,omitempty"`
 	// Pool is the mutually-exclusive DB account_pool summary (same as /status pool).
-	Pool         *PoolSummary     `json:"pool,omitempty"`
-	StoreSource  string           `json:"store_source,omitempty"`
-	StoreBackend string           `json:"store_backend,omitempty"`
-	AuthFileRole string           `json:"auth_file_role,omitempty"`
+	Pool         *PoolSummary `json:"pool,omitempty"`
+	StoreSource  string       `json:"store_source,omitempty"`
+	StoreBackend string       `json:"store_backend,omitempty"`
+	AuthFileRole string       `json:"auth_file_role,omitempty"`
 }
 
 // AccountListFilter controls server-side account list filters.

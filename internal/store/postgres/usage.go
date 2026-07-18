@@ -612,7 +612,7 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 			"cache_creation_tokens": cacheCreate, "reasoning_tokens": reasoning, "client_ip": stringPtr(clientIP), "user_agent": stringPtr(userAgent),
 			"status_code": intPtr(statusCode), "latency_ms": intPtr(latency), "ttft_ms": intPtr(ttft), "error": stringPtr(errText), "detail": detailMap,
 			"reasoning_effort": reasoningEffort,
-			"api_key_name": stringPtr(keyName), "api_key_prefix": stringPtr(keyPrefix), "account_email": stringPtr(accountEmail),
+			"api_key_name":     stringPtr(keyName), "api_key_prefix": stringPtr(keyPrefix), "account_email": stringPtr(accountEmail),
 		})
 	}
 	return map[string]any{

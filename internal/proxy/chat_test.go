@@ -663,7 +663,7 @@ func TestChatRemapsUpdateToEditWithAllowedTools(t *testing.T) {
 	delta2 := ChatDelta{
 		ToolCalls: []map[string]any{
 			{"index": 0, "function": map[string]any{
-				"name": "Update",
+				"name":      "Update",
 				"arguments": `{"file_path":"/right","old_string":"a","new_string":"b","explanation":"why"}`,
 			}},
 		},
@@ -817,4 +817,3 @@ func TestChatToolAssemblerFeedFinishThenSoftDisconnect(t *testing.T) {
 		t.Fatalf("unexpected second terminal %#v", term)
 	}
 }
-
