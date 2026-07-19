@@ -812,18 +812,21 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		}
 		return write([]byte(": keepalive\n\n"), false)
 	})
-	// Soft disconnect / write abort after tools started: still force-finish if we
-	// never saw [DONE] (upstream may have closed without finish_reason).
-	if assembler.Holding() || assembler.EmittedAny() {
-		soft := err == nil || clientSoftGone || errors.Is(err, r.Context().Err()) || isSoftClientWriteError(err)
-		if soft {
+	// Soft disconnect / write abort / mid-stream upstream drop after tools or
+	// content started: force-finish so clients do not hang, and avoid a second
+	// error JSON that Claude Code reports as "Server error mid-response".
+	hasStreamPayload := assembler.Holding() || assembler.EmittedAny() || stats.FirstTokenMS > 0
+	clientSoft := clientSoftGone || errors.Is(err, r.Context().Err()) || isSoftClientWriteError(err)
+	upstreamMid := err != nil && !clientSoft
+	if hasStreamPayload {
+		if err == nil || clientSoft || upstreamMid {
 			_ = flushAssemblerTerminal()
-			if clientSoftGone || errors.Is(err, r.Context().Err()) || isSoftClientWriteError(err) {
+			if clientSoft || upstreamMid {
 				return stats, nil
 			}
 		}
 	}
-	if err != nil && !errors.Is(err, r.Context().Err()) {
+	if err != nil && !errors.Is(err, r.Context().Err()) && !hasStreamPayload {
 		msg, errType := openAIErrorFromCause(err)
 		encoded, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": errType}})
 		_ = write(append(append([]byte("data: "), encoded...), '\n', '\n'), true)
@@ -1915,18 +1918,19 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 		return writeFrame(responsesKeepaliveFrame(), false)
 	})
 	clientGone := errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
-	if err != nil && !clientGone {
+	hasPayload := streamer.HasClientPayload() || streamer.HasPendingTools()
+	// Upstream mid-stream drop after client already saw content/tools: soft Complete
+	// only. response.failed mid-turn surfaces as Claude/Codex "Server error mid-response".
+	upstreamMidError := err != nil && !clientGone
+	if upstreamMidError && !hasPayload {
 		msg, errType := openAIErrorFromCause(err)
 		_ = emitFrames(streamer.Fail(msg, errType), true)
-		// Fall through to Complete when envelope already has payload.
+		return usage, firstTokenMS, err
 	}
 	respUsage := responsesUsageFromOpenAI(usage)
 	// Always try to close the Responses envelope so Codex / Claude Code leave "running".
-	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone && err == nil {
+	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone && !upstreamMidError {
 		return usage, firstTokenMS, termErr
-	}
-	if err != nil && !clientGone {
-		return usage, firstTokenMS, err
 	}
 	// If Complete was a no-op (empty payload) but we already opened the envelope
 	// (early Start), force a failed/completed terminal so the client unblocks.
@@ -1934,8 +1938,11 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 		// HasClientPayload now includes started envelope; if still empty of text/tools,
 		// Fail is preferred for true empty upstream.
 		_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
-	} else if clientGone {
-		// Soft disconnect after content: Complete already forced above.
+		if upstreamMidError {
+			return usage, firstTokenMS, err
+		}
+	} else if clientGone || upstreamMidError {
+		// Soft disconnect / mid-stream upstream drop after content: Complete already forced.
 		return usage, firstTokenMS, nil
 	}
 	if clientGone {
@@ -2089,20 +2096,26 @@ func streamOpenAIResponsesContinue(w http.ResponseWriter, r *http.Request, body 
 		return writeFrame(responsesKeepaliveFrame(), false)
 	})
 	clientGone := errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
-	if err != nil && !clientGone {
+	hasPayload := streamer.HasClientPayload() || streamer.HasPendingTools()
+	upstreamMidError := err != nil && !clientGone
+	if upstreamMidError && !hasPayload {
 		msg, errType := openAIErrorFromCause(err)
 		_ = emitFrames(streamer.Fail(msg, errType), true)
 		return usage, firstTokenMS, err
 	}
 	respUsage := responsesUsageFromOpenAI(usage)
-	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone {
+	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone && !upstreamMidError {
 		return usage, firstTokenMS, termErr
 	}
 	// Empty-only envelope: unblock client with failed terminal.
 	if !streamer.HasClientPayload() {
 		_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
+		if upstreamMidError {
+			return usage, firstTokenMS, err
+		}
 	}
-	if clientGone {
+	if clientGone || upstreamMidError {
+		// Soft terminal after content (or pending tools force-finished).
 		return usage, firstTokenMS, nil
 	}
 	return usage, firstTokenMS, err
@@ -2595,15 +2608,20 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	}, onIdle)
 
 	clientGone := probe.gone || errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
-	if err != nil && !clientGone {
-		msg, errType := anthropicErrorFromCause(err)
-		_ = emitFrames(anthropic.TerminalError(msg, errType), true)
-		// Still attempt Finish below when we already had payload (partial tools).
-	}
 	// Real payload = model deltas OR assembler emitted/held content/tools.
 	// Early message_start alone must NOT count as success (admin showed ok=true,
 	// tokens=0, ttft=null for ~1s intermittent empties).
-	hasPayload := sawModel || assembler.HasClientPayload()
+	hasPayload := sawModel || assembler.HasClientPayload() || assembler.HasPendingTools() || assembler.HasHeldContent()
+	// Upstream read/error mid-stream AFTER the client already has content/tools must
+	// soft-close the Anthropic envelope (Finish only). Emitting event:error here is
+	// what Claude Code surfaces as "API Error: Server error mid-response / response
+	// above may be incomplete" even when most of the turn already landed.
+	upstreamMidError := err != nil && !clientGone
+	if upstreamMidError && !hasPayload {
+		msg, errType := anthropicErrorFromCause(err)
+		_ = emitFrames(anthropic.TerminalError(msg, errType), true)
+		return openAIUsage, firstTokenMS, err
+	}
 	if !hasPayload {
 		if clientGone {
 			// Soft disconnect before any model payload: still close envelope if open.
@@ -2618,13 +2636,11 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	if finish == "" {
 		finish = "stop"
 	}
-	// Always try terminal frames after any payload (including write-error soft disconnect)
-	// so Claude Code never hangs on a half-open tool_use as "Tool use interrupted".
-	if termErr := emitFrames(assembler.Finish(finish, usage), true); termErr != nil && !clientGone && err == nil {
+	// Always try terminal frames after any payload (including write-error soft disconnect
+	// and mid-stream upstream errors) so Claude Code never hangs on a half-open
+	// tool_use as "Tool use interrupted" / "Server error mid-response".
+	if termErr := emitFrames(assembler.Finish(finish, usage), true); termErr != nil && !clientGone && !upstreamMidError {
 		return openAIUsage, firstTokenMS, termErr
-	}
-	if err != nil && !clientGone {
-		return openAIUsage, firstTokenMS, err
 	}
 	// After Finish, if every tool was incomplete and no text was flushed, treat as empty.
 	if !assembler.HasClientPayload() && !assembler.HasPendingTools() {
@@ -2636,8 +2652,9 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 			return openAIUsage, firstTokenMS, empty
 		}
 	}
-	if clientGone {
-		// Client left after real payload: success-ish for usage, no error.
+	if clientGone || upstreamMidError {
+		// Soft terminal: client left, or upstream dropped after real payload.
+		// Do not return the raw upstream err — stream already closed cleanly.
 		return openAIUsage, firstTokenMS, nil
 	}
 	return openAIUsage, firstTokenMS, err

@@ -19,6 +19,9 @@ const (
 	ClassServer        FailureClass = "server_error"
 	ClassModelCapacity FailureClass = "model_capacity"
 	ClassBilling       FailureClass = "billing_quota"
+	// ClassEmptyUpstream is a transient HTTP 200 with no content/tool payload.
+	// Matches Python empty_upstream short cool (8–20s) — must NOT use 5xx 3m cool.
+	ClassEmptyUpstream FailureClass = "empty_upstream"
 )
 
 // CooldownDecision is the structured action for pool/picker after a failure.
@@ -51,11 +54,12 @@ var (
 // Decision priority is body/code text first, status second:
 //  1. free-usage / 额度用完 phrasing → hard account cooldown only (no model block)
 //  2. billing hard-quota → long cooldown
-//  3. model capacity / overloaded → short cool
-//  4. auth 401/403 → short cool
-//  5. bare rate-limit / 429 without quota language → shorter cool
-//  6. bare 5xx → brief cool
-//  7. validation / client errors → do NOT cool
+//  3. empty model output / no content/tool_calls (HTTP 200 glitch) → ultra-short cool
+//  4. model capacity / overloaded → short cool
+//  5. auth 401/403 → short cool
+//  6. bare rate-limit / 429 without quota language → shorter cool
+//  7. bare 5xx → brief cool
+//  8. validation / client errors → do NOT cool
 //
 // requestedModel is the outbound model for this request; used as a fallback when
 // the upstream body does not name a model (common for Chinese/admin paraphrases).
@@ -150,6 +154,23 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 		return d
 	}
 
+	// Empty HTTP 200 / empty model output is a transient upstream glitch.
+	// Python uses a sticky skip of 8–20s (not multi-minute 5xx cool) so the pool
+	// is not emptied under load. Status is often rewritten to 502 by the proxy
+	// path; body text must win over status classification.
+	if isEmptyModelOutputText(low) || isEmptyModelOutputCode(codeFromJSON) {
+		until := time.Now().Add(12 * time.Second)
+		return CooldownDecision{
+			Class:          ClassEmptyUpstream,
+			Code:           string(ClassEmptyUpstream),
+			Model:          model,
+			Until:          &until,
+			ShouldCooldown: true,
+			BlockModel:     false,
+			Reason:         firstNonEmpty(text, "empty model output"),
+		}
+	}
+
 	// Model capacity / overloaded (not account free-usage) — short cool only.
 	if isModelCapacityText(low) {
 		until := time.Now().Add(3 * time.Minute)
@@ -193,6 +214,8 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 	}
 
 	// Upstream 5xx — brief cool.
+	// Note: empty-model-output paths often surface as synthetic 502; those are
+	// already handled above via body text before this branch.
 	if status >= 500 && status <= 599 {
 		until := time.Now().Add(3 * time.Minute)
 		return CooldownDecision{
@@ -401,6 +424,32 @@ func isRateLimitText(low string) bool {
 		strings.Contains(low, "too many requests") ||
 		strings.Contains(low, "请求过于频繁") ||
 		strings.Contains(low, "速率限制")
+}
+
+// isEmptyModelOutputText detects synthetic empty-HTTP-200 failures produced by
+// the Go proxy/server when upstream returns 200 with no content/tool_calls.
+// Must be classified before bare 5xx: FailureReporter surfaces these as 502.
+func isEmptyModelOutputText(low string) bool {
+	if low == "" {
+		return false
+	}
+	return strings.Contains(low, "empty model output") ||
+		strings.Contains(low, "no content/tool_calls") ||
+		strings.Contains(low, "no client-visible content") ||
+		strings.Contains(low, "empty_upstream") ||
+		strings.Contains(low, "empty upstream")
+}
+
+func isEmptyModelOutputCode(code string) bool {
+	c := strings.ToLower(strings.TrimSpace(code))
+	if c == "" {
+		return false
+	}
+	return c == "empty_upstream" ||
+		c == "empty-model-output" ||
+		c == "empty_model_output" ||
+		strings.Contains(c, "empty_upstream") ||
+		strings.Contains(c, "empty-model-output")
 }
 
 func isAuthText(low string) bool {

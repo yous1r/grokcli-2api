@@ -363,3 +363,20 @@ func TestExecCommandFullPathProjectsCmdAlways(t *testing.T) {
 		}
 	}
 }
+
+func TestCompleteHoldFailureReturnsNil(t *testing.T) {
+	// Incomplete tool held then force-dropped with no text/reasoning → Complete nil (Fail path).
+	s := NewLiveStreamer("resp_hold", "grok", nil)
+	_ = s.Start()
+	_ = s.ToolDeltas([]ToolDelta{{Index: 0, ID: "call_1", Name: "Bash", Arguments: `{"path":`}})
+	if !s.HasPendingTools() {
+		t.Fatal("expected pending incomplete tool")
+	}
+	if s.HasClientPayload() {
+		t.Fatal("incomplete hold must not count as client payload")
+	}
+	frames := s.Complete(&Usage{})
+	if len(frames) != 0 {
+		t.Fatalf("hold-failure Complete should be empty for Fail path, got %d frames: %v", len(frames), frames)
+	}
+}

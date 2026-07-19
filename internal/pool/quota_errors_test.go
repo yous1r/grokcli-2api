@@ -170,3 +170,50 @@ func TestFreeUsageGrok45BuildFreeCoolOnly(t *testing.T) {
 		t.Fatal("expected cooldown until")
 	}
 }
+
+func TestClassifyEmptyModelOutputShortCool(t *testing.T) {
+	// Proxy rewrites empty HTTP 200 as synthetic 502; body text must win over 5xx cool.
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"synthetic_502_body", 502, "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"},
+		{"status_zero_body", 0, "empty model output"},
+		{"code_empty_upstream", 502, `{"code":"empty_upstream","error":"no content/tool_calls"}`},
+		{"no_client_visible", 502, "no client-visible content after stream"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := ClassifyUpstreamFailure(tc.status, tc.body, "grok-4.5")
+			if !d.ShouldCooldown {
+				t.Fatalf("expected short cool: %+v", d)
+			}
+			if d.Class != ClassEmptyUpstream {
+				t.Fatalf("class=%q want empty_upstream body=%q decision=%+v", d.Class, tc.body, d)
+			}
+			if d.BlockModel {
+				t.Fatalf("empty upstream must not block model: %+v", d)
+			}
+			if d.Until == nil {
+				t.Fatal("expected until")
+			}
+			// Python sticky skip is 8–20s; Go uses 12s mid-point. Must be << 5xx 3m cool.
+			if d.Until.After(time.Now().Add(30 * time.Second)) {
+				t.Fatalf("empty cool too long (would empty the pool): until=%v", d.Until)
+			}
+			if d.Until.Before(time.Now().Add(5 * time.Second)) {
+				t.Fatalf("empty cool too short: until=%v", d.Until)
+			}
+		})
+	}
+
+	// Bare 5xx without empty phrasing still uses server cool (minutes).
+	d := ClassifyUpstreamFailure(502, "bad gateway from reverse proxy")
+	if d.Class != ClassServer {
+		t.Fatalf("bare 502 should be server class: %+v", d)
+	}
+	if d.Until == nil || d.Until.Before(time.Now().Add(2*time.Minute)) {
+		t.Fatalf("bare 5xx cool should be ~3m: %+v", d)
+	}
+}

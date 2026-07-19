@@ -113,6 +113,7 @@ func chatMessagesToResponsesInput(messages []any) []any {
 			if callID == "" {
 				callID = "call_go"
 			}
+			// Tool outputs may be empty strings; that is valid (not a content block).
 			out = append(out, map[string]any{
 				"type":    "function_call_output",
 				"call_id": callID,
@@ -124,22 +125,29 @@ func chatMessagesToResponsesInput(messages []any) []any {
 				for _, call := range calls {
 					out = append(out, call)
 				}
-				// Also keep assistant text if any.
-				if text := stringifyContent(msg["content"]); strings.TrimSpace(text) != "" {
-					out = append(out, responsesMessage("assistant", text))
+				// Also keep assistant text if any (skip empty — Empty content block).
+				if item := responsesMessageOrNil("assistant", msg["content"]); item != nil {
+					out = append(out, item)
 				}
 				continue
 			}
-			out = append(out, responsesMessage("assistant", msg["content"]))
+			if item := responsesMessageOrNil("assistant", msg["content"]); item != nil {
+				out = append(out, item)
+			}
 		case "system":
 			// CPA maps system → developer for cli-chat-proxy cache prefix stability.
-			out = append(out, responsesMessage("developer", msg["content"]))
+			// Never emit empty developer content blocks (upstream 400 Empty content block).
+			if item := responsesMessageOrNil("developer", msg["content"]); item != nil {
+				out = append(out, item)
+			}
 		case "user", "developer":
-			out = append(out, responsesMessage(role, msg["content"]))
+			if item := responsesMessageOrNil(role, msg["content"]); item != nil {
+				out = append(out, item)
+			}
 		default:
 			// Pass through unknown roles as user text when possible.
-			if text := stringifyContent(msg["content"]); strings.TrimSpace(text) != "" {
-				out = append(out, responsesMessage("user", text))
+			if item := responsesMessageOrNil("user", msg["content"]); item != nil {
+				out = append(out, item)
 			}
 		}
 	}
@@ -148,13 +156,52 @@ func chatMessagesToResponsesInput(messages []any) []any {
 
 // responsesMessage builds CPA-compatible Responses input message items:
 // {type:message, role, content:[{type:input_text|output_text, text}]}.
+// Deprecated for empty text — use responsesMessageOrNil.
 func responsesMessage(role string, content any) map[string]any {
+	if item := responsesMessageOrNil(role, content); item != nil {
+		return item
+	}
+	// Fallback for callers that still require a map: use a single space only when
+	// forced. Prefer responsesMessageOrNil and skip empty messages.
 	role = strings.ToLower(strings.TrimSpace(role))
 	partType := "input_text"
 	if role == "assistant" {
 		partType = "output_text"
 	}
-	text := stringifyContent(content)
+	return map[string]any{
+		"type": "message",
+		"role": role,
+		"content": []any{
+			map[string]any{"type": partType, "text": " "},
+		},
+	}
+}
+
+// responsesMessageOrNil returns nil when the message would have an empty content
+// block. cli-chat-proxy rejects {type:input_text|output_text, text:""} with
+// HTTP 400 "Empty content block" (Codex multi-turn / tool-only history).
+func responsesMessageOrNil(role string, content any) map[string]any {
+	role = strings.ToLower(strings.TrimSpace(role))
+	partType := "input_text"
+	if role == "assistant" {
+		partType = "output_text"
+	}
+	// Multi-part image content: preserve non-empty structured parts.
+	if parts, ok := content.([]any); ok && len(parts) > 0 {
+		normalized := normalizeResponsesContentParts(parts, partType)
+		if len(normalized) == 0 {
+			return nil
+		}
+		return map[string]any{
+			"type":    "message",
+			"role":    role,
+			"content": normalized,
+		}
+	}
+	text := strings.TrimSpace(stringifyContent(content))
+	if text == "" {
+		return nil
+	}
 	return map[string]any{
 		"type": "message",
 		"role": role,
@@ -162,6 +209,56 @@ func responsesMessage(role string, content any) map[string]any {
 			map[string]any{"type": partType, "text": text},
 		},
 	}
+}
+
+// normalizeResponsesContentParts drops empty text blocks and unknown empty
+// objects that trigger upstream "Empty content block".
+func normalizeResponsesContentParts(parts []any, defaultPartType string) []any {
+	out := make([]any, 0, len(parts))
+	for _, part := range parts {
+		switch p := part.(type) {
+		case string:
+			if strings.TrimSpace(p) == "" {
+				continue
+			}
+			out = append(out, map[string]any{"type": defaultPartType, "text": p})
+		case map[string]any:
+			typeName := strings.ToLower(strings.TrimSpace(firstString(p, "type")))
+			switch typeName {
+			case "", "text", "input_text", "output_text":
+				text := strings.TrimSpace(firstString(p, "text", "content"))
+				if text == "" {
+					continue
+				}
+				pt := defaultPartType
+				if typeName == "output_text" {
+					pt = "output_text"
+				} else if typeName == "input_text" || typeName == "text" || typeName == "" {
+					pt = defaultPartType
+				}
+				out = append(out, map[string]any{"type": pt, "text": text})
+			case "input_image", "image", "image_url":
+				// Keep non-empty image parts only.
+				if firstString(p, "url") == "" && firstString(p, "image_url") == "" {
+					if img, ok := p["image_url"].(map[string]any); ok {
+						if firstString(img, "url") == "" {
+							continue
+						}
+					} else if firstString(p, "image") == "" {
+						continue
+					}
+				}
+				out = append(out, p)
+			default:
+				// Unknown part with no text: drop (common empty placeholder blocks).
+				if strings.TrimSpace(firstString(p, "text", "content")) == "" {
+					continue
+				}
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 func toolCallsFromMessage(msg map[string]any) []map[string]any {

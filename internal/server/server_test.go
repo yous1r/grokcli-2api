@@ -625,6 +625,89 @@ func TestStreamChatCompletionsForceFinishOnSoftDisconnect(t *testing.T) {
 	}
 }
 
+func TestStreamAnthropicMidStreamUpstreamErrorSoftCloses(t *testing.T) {
+	// Regression: upstream read error AFTER model text/tools must soft-finish
+	// (message_delta/stop) and must NOT emit event:error — that is what Claude Code
+	// surfaces as "API Error: Server error mid-response / response may be incomplete".
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	body := &errAfterChunks{
+		chunks: []string{
+			`data: {"choices":[{"delta":{"content":"partial answer already streamed"}}]}` + "\n\n",
+			`data: {"choices":[{"delta":{"content":" continues."}}]}` + "\n\n",
+		},
+		err: io.ErrUnexpectedEOF,
+	}
+	usage, ttft, err := streamAnthropicMessages(recorder, req, body, "msg_mid", "grok-4.5", false, nil, 0)
+	_ = usage
+	if err != nil {
+		t.Fatalf("expected soft-close nil err after payload, got %v", err)
+	}
+	if ttft <= 0 {
+		t.Fatalf("expected TTFT > 0 after model content, got %d", ttft)
+	}
+	out := recorder.Body.String()
+	if strings.Contains(out, "event: error") {
+		t.Fatalf("must not emit event:error mid-response after payload:\n%s", out)
+	}
+	for _, marker := range []string{"partial answer", "message_delta", "message_stop"} {
+		if !strings.Contains(out, marker) {
+			t.Fatalf("missing %q in soft mid-stream close body (len=%d)", marker, len(out))
+		}
+	}
+}
+
+func TestStreamChatCompletionsMidStreamUpstreamErrorSoftCloses(t *testing.T) {
+	// OpenAI chat: upstream drop after content/tools should finish_reason+[DONE],
+	// not a trailing error JSON (Claude Code / relays treat that as mid-response).
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	body := &errAfterChunks{
+		chunks: []string{
+			`data: {"id":"c1","model":"grok","choices":[{"index":0,"delta":{"content":"hello mid"},"finish_reason":null}]}` + "\n\n",
+		},
+		err: io.ErrUnexpectedEOF,
+	}
+	stats, err := streamChatCompletions(recorder, req, body, 50*time.Millisecond)
+	_ = stats
+	if err != nil {
+		t.Fatalf("expected soft-close nil err after payload, got %v body=%q", err, recorder.Body.String())
+	}
+	out := recorder.Body.String()
+	if strings.Contains(out, `"type":"server_error"`) || strings.Contains(out, `"type": "server_error"`) {
+		t.Fatalf("must not emit error JSON after payload:\n%s", out)
+	}
+	if !strings.Contains(out, "finish_reason") {
+		t.Fatalf("missing finish_reason in %q", out)
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Fatalf("missing [DONE] in %q", out)
+	}
+}
+
+type errAfterChunks struct {
+	chunks []string
+	idx    int
+	buf    []byte
+	err    error
+}
+
+func (e *errAfterChunks) Read(p []byte) (int, error) {
+	if len(e.buf) == 0 {
+		if e.idx >= len(e.chunks) {
+			if e.err != nil {
+				return 0, e.err
+			}
+			return 0, io.EOF
+		}
+		e.buf = []byte(e.chunks[e.idx])
+		e.idx++
+	}
+	n := copy(p, e.buf)
+	e.buf = e.buf[n:]
+	return n, nil
+}
+
 type cancelAfterChunk struct {
 	chunks      []string
 	idx         int

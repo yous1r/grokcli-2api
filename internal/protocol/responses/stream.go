@@ -351,14 +351,17 @@ func (s *LiveStreamer) closeReasoning() []string {
 }
 
 func (s *LiveStreamer) HasClientPayload() bool {
-	// True only when the client has received (or will receive via Complete)
-	// user-visible output: text, reasoning, or tools. Envelope-only start is NOT
-	// a client payload so empty upstream can still Fail.
+	// True only when the client has received user-visible output: text,
+	// reasoning, or *emitted* tools. Incomplete tools that are still held
+	// (name set, not emitted) are NOT payload — they are tracked by
+	// HasPendingTools for SSE keepalive. After force-finish drops incomplete
+	// tools, this must return false so callers Fail instead of completing empty
+	// (Codex "hold-failure" / empty output hang).
 	if s.text != "" || s.reasoning != "" || s.reasoningOpen || s.textOpen {
 		return true
 	}
 	for _, state := range s.tools {
-		if state.emitted || state.name != "" {
+		if state != nil && state.emitted {
 			return true
 		}
 	}
@@ -382,6 +385,20 @@ func (s *LiveStreamer) HasPendingTools() bool {
 	return false
 }
 
+func hasNonStartPayload(frames []string) bool {
+	for _, f := range frames {
+		if strings.Contains(f, "response.output_item") ||
+			strings.Contains(f, "response.function_call") ||
+			strings.Contains(f, "response.output_text") ||
+			strings.Contains(f, "response.reasoning") ||
+			strings.Contains(f, "response.completed") ||
+			strings.Contains(f, "response.failed") {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *LiveStreamer) Complete(usage *Usage) []string {
 	// Preserve empty-stream contract used by callers: if we never opened any client
 	// payload AND never started the envelope, emit nothing so Fail can still run.
@@ -391,25 +408,26 @@ func (s *LiveStreamer) Complete(usage *Usage) []string {
 	if !s.started && !s.HasClientPayload() {
 		return nil
 	}
-	// Empty envelope-only start (no text/tools/reasoning): leave Complete empty so
-	// Fail path can still surface upstream empty HTTP 200 (TestEmptyCompleteCanStillFail).
-	if s.started && s.text == "" && s.reasoning == "" && !s.textOpen && !s.reasoningOpen {
-		hasTool := false
-		for _, state := range s.tools {
-			if state.emitted || state.name != "" {
-				hasTool = true
-				break
-			}
-		}
-		if !hasTool {
-			return nil
-		}
+	// Empty envelope-only start with nothing pending and no open reasoning/text:
+	// leave Complete empty so Fail can surface upstream empty HTTP 200.
+	if s.started && s.text == "" && s.reasoning == "" && !s.textOpen && !s.reasoningOpen && !s.HasPendingTools() && !s.HasClientPayload() {
+		return nil
 	}
 
 	frames := s.Start()
-	// Force-flush remaining tools (incomplete JSON included).
+	// Force-flush remaining tools (incomplete may coerce+emit, or drop).
 	frames = append(frames, s.emitReadyTools(true)...)
+	// Close reasoning even if tools were all held+dropped (Codex still needs terminal).
 	frames = append(frames, s.closeReasoning()...)
+	// True hold-failure: no text/reasoning/emitted tools after force-finish.
+	// Abort completed and let server Fail (empty model output) instead of a hollow
+	// response.completed with empty output (Codex hang / "running").
+	if !s.HasClientPayload() && s.text == "" && s.reasoning == "" && !s.textOpen && !s.reasoningOpen {
+		// If we only produced Start frames, drop them so Fail owns the terminal.
+		if !hasNonStartPayload(frames) {
+			return nil
+		}
+	}
 
 	if s.textOpen {
 		textOut := s.output

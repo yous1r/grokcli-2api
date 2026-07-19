@@ -128,10 +128,18 @@ func InputToMessages(rawInput any, instructions string) []map[string]any {
 			// Upstream cli-chat-proxy rejects those parts as "Empty content block".
 			// Flatten to OpenAI chat multimodal/text shape (Python parity).
 			content = normalizeMessageContent(content)
+			var calls []any
+			if rawCalls, ok := entry["tool_calls"].([]any); ok {
+				calls = rawCalls
+			}
+			// Drop fully empty messages (no text, no tools) — they become Empty content block upstream.
+			if isEmptyMessageContent(content) && len(calls) == 0 {
+				continue
+			}
 			msg := map[string]any{"role": role, "content": content}
-			if calls, ok := entry["tool_calls"].([]any); ok && len(calls) > 0 {
+			if len(calls) > 0 {
 				msg["tool_calls"] = calls
-				if msg["content"] == "" || msg["content"] == nil {
+				if isEmptyMessageContent(content) {
 					msg["content"] = nil
 				}
 			}
@@ -183,7 +191,10 @@ func multimodalContentFromParts(parts []any) any {
 			switch typeName {
 			case "input_text", "output_text", "text", "":
 				text := stringValue(item["text"])
-				// Keep empty text only when it is the sole part; otherwise drop noise.
+				// Drop empty text parts entirely — upstream rejects empty content blocks.
+				if text == "" {
+					continue
+				}
 				textOnly = append(textOnly, text)
 				out = append(out, map[string]any{"type": "text", "text": text})
 			case "input_image", "image", "image_url":
@@ -220,6 +231,19 @@ func multimodalContentFromParts(parts []any) any {
 		return strings.Join(textOnly, "")
 	}
 	return out
+}
+
+func isEmptyMessageContent(content any) bool {
+	switch v := content.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []any:
+		return len(v) == 0
+	default:
+		return false
+	}
 }
 
 func cloneMap(input map[string]any) map[string]any {
