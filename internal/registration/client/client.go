@@ -138,14 +138,14 @@ func (c *Client) doAbsolute(ctx context.Context, method, absPath string, body an
 		// freeze registration log refresh for tens of seconds under load.
 		// Keep under the browser poll budget (~2s) so Go→sidecar→browser stays snappy.
 		httpClient = &http.Client{
-			Timeout: 2 * time.Second,
+			// Keep under browser REG_POLL_TIMEOUT_MS (1.2s) so admin log ticks stay live.
+			Timeout: 900 * time.Millisecond,
 			Transport: &http.Transport{
-				DialContext:         (&net.Dialer{Timeout: 800 * time.Millisecond}).DialContext,
-				MaxIdleConns:        64,
-				MaxIdleConnsPerHost: 16,
-				IdleConnTimeout:     30 * time.Second,
-				// Avoid hanging on half-open connections under concurrent poll storms.
-				ResponseHeaderTimeout: 1500 * time.Millisecond,
+				DialContext:           (&net.Dialer{Timeout: 400 * time.Millisecond}).DialContext,
+				MaxIdleConns:          64,
+				MaxIdleConnsPerHost:   32,
+				IdleConnTimeout:       30 * time.Second,
+				ResponseHeaderTimeout: 700 * time.Millisecond,
 			},
 		}
 	}

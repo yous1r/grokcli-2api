@@ -186,3 +186,81 @@ func TestNormalizeRegistrationConfigMailAliases(t *testing.T) {
 		t.Fatalf("mail_provider=%v", cfg["mail_provider"])
 	}
 }
+
+func TestNormalizeRegistrationConfigTempmail(t *testing.T) {
+	cfg := normalizeRegistrationConfig(map[string]any{"mail_provider": "tempmail.lol"})
+	if cfg["mail_provider"] != "tempmail" {
+		t.Fatalf("mail_provider=%v", cfg["mail_provider"])
+	}
+	cfg = normalizeRegistrationConfig(map[string]any{"mail_provider": "lol"})
+	if cfg["mail_provider"] != "tempmail" {
+		t.Fatalf("mail_provider=%v", cfg["mail_provider"])
+	}
+}
+
+func TestSanitizeTempmailEmptyKeyOK(t *testing.T) {
+	cfg := map[string]any{
+		"mail_provider":    "tempmail",
+		"tempmail_api_key": "",
+		"tempmail_domain":  "",
+		"moemail_api_key":  "mk_should_not_leak",
+		"api_key":          "mk_should_not_leak",
+	}
+	sanitizeRegistrationMailSecrets(cfg)
+	if cfg["tempmail_api_key"] != "" {
+		t.Fatalf("tempmail key should stay empty, got %v", cfg["tempmail_api_key"])
+	}
+	// Active api_key for tempmail provider must be empty free-tier, not moemail key.
+	if cfg["api_key"] != "" {
+		t.Fatalf("tempmail active api_key should be empty free tier, got %v", cfg["api_key"])
+	}
+}
+
+func TestMailSecretFitsSlotTempmail(t *testing.T) {
+	if !mailSecretFitsSlot("tempmail_api_key", "") {
+		t.Fatal("empty should fit tempmail")
+	}
+	if !mailSecretFitsSlot("tempmail_api_key", "some-paid-bearer-token") {
+		t.Fatal("opaque bearer should fit tempmail")
+	}
+	if mailSecretFitsSlot("tempmail_api_key", "mk_moe") {
+		t.Fatal("mk_ must not fit tempmail")
+	}
+	if mailSecretFitsSlot("tempmail_api_key", "AC-yyds") {
+		t.Fatal("AC- must not fit tempmail")
+	}
+}
+
+func TestRegistrationConfigPatchForPersistClearsTempmailKey(t *testing.T) {
+	req := map[string]any{
+		"mail_provider":    "tempmail",
+		"tempmail_api_key": "",
+		"tempmail_domain":  "",
+	}
+	merged := map[string]any{
+		"mail_provider":    "tempmail",
+		"tempmail_api_key": "old-paid-key",
+		"tempmail_domain":  "custom.example",
+		"moemail_api_key":  "mk_other",
+		"moemail_domain":   "lolicr.com",
+	}
+	patch := registrationConfigPatchForPersist(req, merged)
+	if v := strings.TrimSpace(fmt.Sprint(patch["tempmail_api_key"])); v != "" && v != "<nil>" {
+		t.Fatalf("expected cleared tempmail key, got %v", patch["tempmail_api_key"])
+	}
+	if v := strings.TrimSpace(fmt.Sprint(patch["tempmail_domain"])); v != "" && v != "<nil>" {
+		t.Fatalf("expected cleared tempmail domain, got %v", patch["tempmail_domain"])
+	}
+	// Must not write remapped moemail key from tempmail active path.
+	if v, ok := patch["moemail_api_key"]; ok {
+		if s := strings.TrimSpace(fmt.Sprint(v)); s != "" && s != "mk_other" {
+			t.Fatalf("moemail key remapped unexpectedly: %v", v)
+		}
+	}
+}
+
+func TestMailSecretFitsSlotTempmailEmpty(t *testing.T) {
+	if !mailSecretFitsSlot("tempmail_api_key", "") {
+		t.Fatal("empty tempmail key must be allowed")
+	}
+}

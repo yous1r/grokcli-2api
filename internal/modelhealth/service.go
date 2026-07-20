@@ -1203,7 +1203,11 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		base["status_code"] = status
 		base["error"] = errText
 		base["latency_ms"] = time.Since(started).Milliseconds()
-		if autoDisable && s.Store != nil {
+		// register/import probes: never cool or disable — keep new accounts 轮询中.
+		srcLower := strings.ToLower(strings.TrimSpace(source))
+		skipMutate := srcLower == "register" || srcLower == "import" || srcLower == "registration" || srcLower == "sso_import"
+		if autoDisable && s.Store != nil && !skipMutate {
+
 			switch {
 			case status == 401 || status == 403:
 				if _, e := s.Store.SetAccountEnabled(ctx, auth.ID, false); e == nil {

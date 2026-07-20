@@ -1890,11 +1890,25 @@ func numberToInt64(value any) (int64, bool) {
 	}
 }
 
-// emptyStreamPeekBudget is how long we wait for an *instant* empty HTTP 200
-// ([DONE] with no content/tool_calls) before treating the stream as live.
-// Must stay short so healthy TTFT is not delayed; slow first tokens must never
-// be classified as empty (pass through after budget).
-const emptyStreamPeekBudget = 80 * time.Millisecond
+// emptyStreamNoDataBudget: pure silence window before we enter the long wait.
+// Instant activity (hollow or model) is classified as soon as the first frame lands.
+const emptyStreamNoDataBudget = 120 * time.Millisecond
+
+// emptyStreamAbsBudget: max open-time peek when upstream has not yet produced a
+// model payload. High-effort hollow empties often finish in 5–15s of silence or
+// empty deltas then [DONE]. Waiting here (before Anthropic message_start) lets
+// OpenStream failover. Healthy high-effort first tokens usually arrive within
+// this window; if not, we pass live and the stream continues (slow TTFT).
+const emptyStreamAbsBudget = 15 * time.Second
+
+// emptyStreamHollowBudget: once hollow frames arrive, prefer resolving empty vs
+// live within this sub-window (still capped by absBudget). Instant hollow+[DONE]
+// failovers faster than waiting the full abs budget.
+const emptyStreamHollowBudget = 8 * time.Second
+
+// emptyStreamPeekBudget is an alias kept for tests that time delays against the
+// short silence window (historical name).
+const emptyStreamPeekBudget = emptyStreamNoDataBudget
 
 // guardStreamAgainstEmpty peeks upstream SSE until the first model payload or
 // stream end. Empty HTTP 200 bodies can then failover before the client envelope
@@ -1904,14 +1918,10 @@ const emptyStreamPeekBudget = 80 * time.Millisecond
 // buffer (pumpedStream). Peek and the client consumer both read that buffer —
 // never two concurrent readers on the HTTP body.
 //
-// The previous implementation returned raw `body` after a 50ms timeout while
-// the peeker was still scanning. That dual-read race dropped frames under
-// medium thinking TTFT (~seconds) and surfaced as intermittent
-// "empty model output (no content/tool_calls)" 502 with ttft_missing.
-//
-// On budget timeout the peeker is interrupted at its next Read wait (no data
-// yet → empty Tee buffer; partial events stay in the pump buffer for the
-// client). OpenStream never dual-reads and never waits for slow first tokens.
+// Hollow-stream detection: if frames arrive but carry no content/reasoning/tools
+// (empty delta / usage-only / finish_reason only), keep peeking until [DONE] or
+// emptyStreamHollowBudget. Previously an 80ms budget treated hollow drips as live
+// and the Anthropic envelope opened before we knew the stream would end empty.
 func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 	if body == nil {
 		return nil, true, &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
@@ -1920,10 +1930,11 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 	pumped := newPumpedStream(body)
 
 	type peekResult struct {
-		sawModel bool
-		sawDone  bool
-		buffered string
-		err      error
+		sawModel  bool
+		sawDone   bool
+		sawHollow bool // at least one non-model frame arrived
+		buffered  string
+		err       error
 	}
 
 	stopPeek := make(chan struct{})
@@ -1935,8 +1946,7 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 		var buffered strings.Builder
 		sawModel := false
 		sawDone := false
-		// peekerReader can return errStopPeek while waiting for data so the
-		// budget path unblocks without dual-reading the pump.
+		sawHollow := false
 		src := &peekerReader{p: pumped, stop: stopPeek}
 		err := grok.ReadSSE(io.TeeReader(src, &buffered), func(event grok.Event) error {
 			if event.Done {
@@ -1945,19 +1955,26 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 			}
 			delta, parseErr := parseChatDelta(event.Data)
 			if parseErr != nil {
+				// Malformed / keepalive — still counts as activity (not pure silence).
+				sawHollow = true
 				return nil
 			}
-			if strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
+			if strings.TrimSpace(delta.Content) != "" ||
+				strings.TrimSpace(delta.Reasoning) != "" ||
+				len(delta.ToolCalls) > 0 ||
+				delta.FunctionCall != nil {
 				sawModel = true
 				return errStopPeek
 			}
+			// Empty delta, finish_reason-only, usage-only → hollow drip.
+			sawHollow = true
 			return nil
 		})
 		if err != nil && !errors.Is(err, errStopPeek) {
 			resultCh <- peekResult{err: err}
 			return
 		}
-		resultCh <- peekResult{sawModel: sawModel, sawDone: sawDone, buffered: buffered.String()}
+		resultCh <- peekResult{sawModel: sawModel, sawDone: sawDone, sawHollow: sawHollow, buffered: buffered.String()}
 	}()
 
 	finishLive := func(buffered string) io.ReadCloser {
@@ -1965,34 +1982,81 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 		return &multiClose{Reader: replayed, closer: pumped}
 	}
 
+	// Stage 1: short wait — pure silence (slow TTFT) vs any activity.
 	select {
 	case result := <-resultCh:
 		if result.err != nil {
 			_ = pumped.Close()
 			return nil, false, result.err
 		}
-		if !result.sawModel && result.sawDone {
+		if result.sawModel {
+			return finishLive(result.buffered), false, nil
+		}
+		if result.sawDone && !result.sawModel {
 			_ = pumped.Close()
 			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
 		}
 		return finishLive(result.buffered), false, nil
-	case <-time.After(emptyStreamPeekBudget):
-		// Interrupt peeker (unblocks peekerReader wait). Then wait for it so
-		// ownership of the pump is exclusive before the client starts reading.
-		// With no data yet, Tee buffer is empty and finishLive hands the full
-		// pump to the client — same TTFT as the old pass-through, without dual-read.
+	case <-time.After(emptyStreamNoDataBudget):
+	}
+
+	// Race: peeker may have finished during the short wait.
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			_ = pumped.Close()
+			return nil, false, result.err
+		}
+		if result.sawModel {
+			return finishLive(result.buffered), false, nil
+		}
+		if result.sawDone && !result.sawModel {
+			_ = pumped.Close()
+			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		}
+		return finishLive(result.buffered), false, nil
+	default:
+	}
+
+	// Still peeking after noDataBudget. Wait up to absBudget for model / Done.
+	// Pure silence that ends empty in 5–15s (Claude high-effort hollow) must NOT
+	// be passed live at 6s — that was the 12s ttft_missing empty path.
+	// Hollow drips use the same wait (capped); model frames return immediately.
+	waitRem := emptyStreamAbsBudget - emptyStreamNoDataBudget
+	if waitRem < time.Second {
+		waitRem = time.Second
+	}
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			_ = pumped.Close()
+			return nil, false, result.err
+		}
+		if result.sawModel {
+			return finishLive(result.buffered), false, nil
+		}
+		if result.sawDone && !result.sawModel {
+			_ = pumped.Close()
+			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		}
+		return finishLive(result.buffered), false, nil
+	case <-time.After(waitRem):
 		requestStop()
 		result := <-resultCh
 		if result.err != nil {
 			_ = pumped.Close()
 			return nil, false, result.err
 		}
-		// Budget path: even if peeker raced in a Done just after timeout, still
-		// honor true empty (instant hollow after slightly-slow network).
-		if !result.sawModel && result.sawDone {
+		if result.sawModel {
+			return finishLive(result.buffered), false, nil
+		}
+		// Terminal empty within abs window (including hollow-then-DONE finishing
+		// just as we stop) → failover.
+		if result.sawDone && !result.sawModel {
 			_ = pumped.Close()
 			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
 		}
+		// Still no terminal signal after absBudget → live (very slow first token).
 		return finishLive(result.buffered), false, nil
 	}
 }

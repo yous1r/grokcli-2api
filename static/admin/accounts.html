@@ -309,6 +309,7 @@
         <option value="yyds">YYDS Mail（vip.215.im）</option>
         <option value="gptmail">GPTMail（mail.chatgpt.org.uk）</option>
         <option value="cfmail">Cloudflare Temp Email</option>
+        <option value="tempmail">TempMail.lol（免费无需 Key）</option>
       </select>
     </div>
     <div class="g2a-field" style="grid-column:1/-1">
@@ -338,33 +339,44 @@
     <div class="g2a-field reg-mail-panel" data-mail="yyds" id="reg-panel-yyds-domain" style="grid-column:1/-1;display:none">
       <label for="reg-yyds-domain">YYDS 邮箱域名（可多个）</label>
       <textarea id="reg-yyds-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=自动随机公开域名" autocomplete="off" name="reg-yyds-domain" spellcheck="false"></textarea>
-      <div class="g2a-muted" style="margin-top:4px;font-size:12px">YYDS 主机固定（vip.215.im）；留空则每次从目录随机，填写多个则批量注册轮询。与 MoeMail / GPTMail 独立存储。</div>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：maliapi.215.im（文档 <a href="https://vip.215.im/docs" target="_blank" rel="noopener">vip.215.im/docs</a>）。Key 填 <code>AC-…</code>；域名留空则从公开目录随机，多行则批量轮询。收信走 <code>/v1/messages/next</code> 取验证码。</div>
     </div>
 
     <!-- GPTMail: optional key + optional domains (fixed host) -->
     <div class="g2a-field reg-mail-panel" data-mail="gptmail" id="reg-panel-gptmail-key" style="display:none">
       <label for="reg-gptmail-api-key">GPTMail API Key</label>
-      <input id="reg-gptmail-api-key" placeholder="sk-...（可空=公共测试）" autocomplete="off" name="reg-gptmail-api-key" />
+      <input id="reg-gptmail-api-key" placeholder="sk-…（文档页公共测试 Key 或商店 Key）" autocomplete="off" name="reg-gptmail-api-key" />
     </div>
     <div class="g2a-field reg-mail-panel" data-mail="gptmail" id="reg-panel-gptmail-domain" style="grid-column:1/-1;display:none">
       <label for="reg-gptmail-domain">GPTMail 邮箱域名（可多个）</label>
       <textarea id="reg-gptmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=GPTMail 随机分配" autocomplete="off" name="reg-gptmail-domain" spellcheck="false"></textarea>
-      <div class="g2a-muted" style="margin-top:4px;font-size:12px">GPTMail 主机固定（mail.chatgpt.org.uk）；Key/域名与其它邮箱服务分开存库。</div>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：https://mail.chatgpt.org.uk · 文档 <a href="https://mail.chatgpt.org.uk/zh/api/" target="_blank" rel="noopener">/zh/api/</a>。Header <code>X-API-Key: sk-…</code>；域名留空则 generate 随机，或填多行轮询。勿再用 gpt-test。</div>
     </div>
 
     <!-- Cloudflare Temp Email: Base URL + admin password + domains -->
     <div class="g2a-field reg-mail-panel" data-mail="cfmail" id="reg-panel-cfmail-base" style="grid-column:1/-1;display:none">
       <label for="reg-cfmail-base-url">CF Temp Email Base URL</label>
-      <input id="reg-cfmail-base-url" placeholder="https://your-worker.example.workers.dev" autocomplete="off" name="reg-cfmail-base-url" />
+      <input id="reg-cfmail-base-url" placeholder="https://temp-email-api.your-domain.com 或 *.workers.dev" autocomplete="off" name="reg-cfmail-base-url" />
     </div>
     <div class="g2a-field reg-mail-panel" data-mail="cfmail" id="reg-panel-cfmail-key" style="display:none">
       <label for="reg-cfmail-api-key">CF Temp Email Admin 密码</label>
-      <input id="reg-cfmail-api-key" placeholder="管理后台密码（x-admin-auth）" autocomplete="off" name="reg-cfmail-api-key" />
+      <input id="reg-cfmail-api-key" placeholder="ADMIN_PASSWORDS（请求头 x-admin-auth）" autocomplete="off" name="reg-cfmail-api-key" />
     </div>
     <div class="g2a-field reg-mail-panel" data-mail="cfmail" id="reg-panel-cfmail-domain" style="grid-column:1/-1;display:none">
       <label for="reg-cfmail-domain">CF Temp Email 域名（可多个）</label>
-      <textarea id="reg-cfmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=从 /open_api/settings 自动选" autocomplete="off" name="reg-cfmail-domain" spellcheck="false"></textarea>
+      <textarea id="reg-cfmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=GET /open_api/settings 自动选；Base 填 Worker API 源（非 Pages 前端）" autocomplete="off" name="reg-cfmail-domain" spellcheck="false"></textarea>
       <div class="g2a-muted" style="margin-top:4px;font-size:12px">与 MoeMail 的 Base URL / Key / 域名完全独立，切换不会互相覆盖。</div>
+    </div>
+
+    <!-- TempMail.lol: free no key; optional Plus/Ultra Bearer key -->
+    <div class="g2a-field reg-mail-panel" data-mail="tempmail" id="reg-panel-tempmail-key" style="display:none">
+      <label for="reg-tempmail-api-key">TempMail.lol API Key（可选）</label>
+      <input id="reg-tempmail-api-key" placeholder="免费层级留空；Plus/Ultra 填 Bearer Key" autocomplete="off" name="reg-tempmail-api-key" />
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="tempmail" id="reg-panel-tempmail-domain" style="grid-column:1/-1;display:none">
+      <label for="reg-tempmail-domain">TempMail.lol 自定义域名（可选，付费）</label>
+      <textarea id="reg-tempmail-domain" class="g2a-input" rows="2" placeholder="免费层级请留空（系统随机域名）；自定义域名需 Plus/Ultra" autocomplete="off" name="reg-tempmail-domain" spellcheck="false"></textarea>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：api.tempmail.lol · 文档 <a href="https://tempmail.lol/zh/api" target="_blank" rel="noopener">tempmail.lol/zh/api</a>。免费：POST /v2/inbox/create（无需 Key），收信 GET /v2/inbox?token=…</div>
     </div>
     <div class="g2a-field">
       <label for="reg-captcha-provider">过盾方式</label>
@@ -535,6 +547,6 @@
   <script src="/static/dist/api.9ac71f7ed9.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.27237c6a3d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.f859b9193c.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

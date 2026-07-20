@@ -371,6 +371,12 @@ def _resolve_mail_credentials(
         if cfg.get("cfmail_domain") not in (None, ""):
             dom = str(cfg.get("cfmail_domain") or "").strip()
         base = str(cfg.get("cfmail_base_url") or base).strip()
+    elif prov == "tempmail":
+        # Free tier: no key. Optional Bearer key for Plus/Ultra.
+        key = str(cfg.get("tempmail_api_key") or key).strip()
+        if cfg.get("tempmail_domain") not in (None, ""):
+            dom = str(cfg.get("tempmail_domain") or "").strip()
+        base = ""  # fixed https://api.tempmail.lol
     else:
         if cfg.get("moemail_domain") not in (None, ""):
             dom = str(cfg.get("moemail_domain") or "").strip()
@@ -510,7 +516,7 @@ def _record_register_task(
 
 
 
-def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_lines: int = 40) -> None:
+def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_lines: int = 28) -> None:
     """Append a timestamped progress line for real-time admin registration log UI."""
     try:
         lines = list(sess.get("log_lines") or [])
@@ -885,8 +891,8 @@ def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
     out.pop("auth_json", None)
     # Compact: keep only short tail for admin UI (bulk reg holds hundreds of sessions).
     lines = list(out.get("log_lines") or [])
-    if len(lines) > 24:
-        out["log_lines"] = lines[-24:]
+    if len(lines) > 16:
+        out["log_lines"] = lines[-16:]
     if out.get("log") and len(str(out.get("log"))) > 800:
         out["log"] = str(out.get("log"))[-800:]
         out["output_tail"] = out["log"]
@@ -1245,10 +1251,10 @@ def _make_email_receiver(
     prov = normalize_mail_provider(mail_provider, base_url=base)
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     # GPTMail allows empty key (public gpt-test). YYDS/MoeMail/CF require a key.
-    if not key and prov != "gptmail":
+    if not key and prov not in {"tempmail"}:
         raise ValueError(
             f"Mail API key missing for provider={prov}. "
-            "Save the key in 协议注册配置 (YYDS/GPTMail/MoeMail each keep their own key)."
+            "Save the key in 协议注册配置 (each provider keeps its own key; TempMail.lol free needs none)."
         )
     # Multi-domain config (newlines/commas): rotate by domain_index in batch jobs.
     # Empty list => provider auto-pick (YYDS/GPTMail/CF) or MOEMAIL_DOMAIN fallback.
@@ -1261,7 +1267,7 @@ def _make_email_receiver(
     else:
         # YYDS/GPTMail/CFMail: empty domain means provider-side auto/random pick.
         # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
-        if prov in {"yyds", "gptmail", "cfmail"}:
+        if prov in {"yyds", "gptmail", "cfmail", "tempmail"}:
             dom = ""
         else:
             dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
@@ -1303,6 +1309,8 @@ def _make_email_receiver(
                 default_base = "https://mail.chatgpt.org.uk"
             elif provider == "cfmail":
                 default_base = "https://temp-email-api.awsl.uk"
+            elif provider == "tempmail":
+                default_base = "https://api.tempmail.lol"
             else:
                 default_base = "https://moemail.521884.xyz"
             self.base_url = base_url or default_base
@@ -1329,15 +1337,34 @@ def _make_email_receiver(
                 if callable(should_cancel) and should_cancel():
                     raise _RegCancelled("cancelled while waiting for email code")
                 try:
-                    messages = fetch_messages(
-                        self.email_id,
-                        provider=self.provider,
-                        api_key=self.api_key,
-                        base_url=self.base_url,
-                        include_details=True,
-                        address=self.email,
-                        token=self.token or None,
-                    )
+                    messages = []
+                    # YYDS: prefer GET /v1/messages/next (long-poll + verificationCode).
+                    if self.provider == "yyds":
+                        try:
+                            from grok2api.upstream.moemail import yyds_wait_next_message
+
+                            nxt = yyds_wait_next_message(
+                                address=self.email,
+                                api_key=self.api_key,
+                                base_url=self.base_url,
+                                token=self.token or None,
+                                wait=min(15, max(1, int(deadline - time.time()))),
+                                email_id=self.email_id,
+                            )
+                            if nxt:
+                                messages = [nxt]
+                        except Exception:
+                            messages = []
+                    if not messages:
+                        messages = fetch_messages(
+                            self.email_id,
+                            provider=self.provider,
+                            api_key=self.api_key,
+                            base_url=self.base_url,
+                            include_details=True,
+                            address=self.email,
+                            token=self.token or None,
+                        )
                     for item in messages:
                         # Prefer xAI AAA-BBB codes first.
                         text = "\n".join(
@@ -3724,8 +3751,12 @@ def _run_registration(
 
                 for aid in imported_ids:
                     try:
+                        # New registrations must enter the live rotation pool.
+                        # Never auto-disable / free-usage-cool on the post-import
+                        # probe — free accounts often report free-usage-exhausted
+                        # on the first ping and were wrongly kicked out of 轮询.
                         pr = model_health.probe_single_account(
-                            aid, None, auto_disable=True, source="register"
+                            aid, None, auto_disable=False, source="register"
                         )
                         detail = pr.get("result") if isinstance(pr, dict) else None
                         if not isinstance(detail, dict):
@@ -3767,6 +3798,34 @@ def _run_registration(
                         "error": f"probe module error: {pe}"[:180],
                     }
                 )
+        # Ensure newly registered accounts stay enabled + not cooling even if a
+        # concurrent background health wave cooled them during import.
+        try:
+            import grok2api.pool.account_pool as account_pool
+            from grok2api.admin.settings_store import get_account_pool_meta, patch_account_pool_meta
+            for aid in imported_ids:
+                try:
+                    account_pool.clear_account_cooldown(aid)
+                except Exception:
+                    pass
+                try:
+                    meta = get_account_pool_meta(aid) or {}
+                    if isinstance(meta, dict) and meta.get("enabled") is False and not meta.get("disabled_for_quota"):
+                        patch_account_pool_meta(
+                            aid,
+                            {
+                                "enabled": True,
+                                "pool_status": "normal",
+                                "disabled_reason": None,
+                                "disabled_source": None,
+                                "cooldown_until": None,
+                                "cooldown_count": 0,
+                            },
+                        )
+                except Exception:
+                    pass
+        except Exception as rexc:
+            print(f"[grok-build-auth] WARN: post-register re-enable failed: {rexc}")
         sess["probe"] = {
             "count": len(probe_summaries),
             "ok": sum(1 for p in probe_summaries if p.get("ok")),
@@ -4897,7 +4956,7 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
     stats = _batch_stats(sids, batch=b)
     # Keep response bounded for large batches. Prefer LIVE (non-terminal) sessions
     # so the admin log always shows in-flight progress, not only the newest finished ones.
-    MAX_BATCH_SESSIONS = 80
+    MAX_BATCH_SESSIONS = 40
     loaded: list[dict[str, Any]] = []
     for s in sids:
         sess = _load_reg_sess(s)

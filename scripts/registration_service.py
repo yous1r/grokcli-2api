@@ -143,7 +143,7 @@ def availability(request: Request) -> dict[str, Any]:
 
 @app.post(f"{API_PREFIX}/mail/domains")
 async def list_mail_domains(request: Request) -> dict[str, Any]:
-    """List selectable domains for YYDS / GPTMail / CF Temp Email / MoeMail."""
+    """List selectable domains for YYDS / GPTMail / CF Temp Email / TempMail.lol / MoeMail."""
     _require_auth(request)
     try:
         body = await request.json()
@@ -166,6 +166,7 @@ async def list_mail_domains(request: Request) -> dict[str, Any]:
         or body.get("yyds_api_key")
         or body.get("gptmail_api_key")
         or body.get("cfmail_api_key")
+        or body.get("tempmail_api_key")
         or ""
     ).strip()
     base = str(
@@ -176,6 +177,7 @@ async def list_mail_domains(request: Request) -> dict[str, Any]:
     ).strip()
     domains: list[str] = []
     note = ""
+    base_out = base
     try:
         if prov == "yyds":
             domains = mail.yyds_list_domains(api_key=key or None, base_url=base or None)
@@ -189,6 +191,10 @@ async def list_mail_domains(request: Request) -> dict[str, Any]:
             domains = mail.cfmail_list_domains(api_key=key or None, base_url=base or None)
             note = "CF Temp Email GET /open_api/settings"
             base_out = (base or mail.CFMAIL_DEFAULT_BASE_URL).rstrip("/")
+        elif prov == "tempmail":
+            domains = mail.tempmail_list_domains(api_key=key or None, base_url=base or None)
+            note = "TempMail.lol free: random domain (no catalog)"
+            base_out = mail.normalize_tempmail_base_url(base or None)
         else:
             # MoeMail has no universal public catalog; return configured domain list.
             domains = mail.parse_domain_list(str(body.get("domain") or body.get("moemail_domain") or ""))
@@ -247,9 +253,11 @@ async def start_job(
             "yyds_api_key",
             "gptmail_api_key",
             "cfmail_api_key",
+            "tempmail_api_key",
             "yyds_domain",
             "gptmail_domain",
             "cfmail_domain",
+            "tempmail_domain",
             "moemail_domain",
             "cfmail_base_url",
             "api_key",
@@ -288,13 +296,17 @@ async def start_job(
     elif prov == "gptmail":
         dom = str(kwargs.get("gptmail_domain") or dom).strip()
         key = str(kwargs.get("gptmail_api_key") or kwargs.get("api_key") or "").strip()
-        # Empty key is OK — adapter falls back to public gpt-test.
-        # Never accept MoeMail/YYDS shapes as GPTMail credentials.
+        # Empty key is OK only if a real sk-… is later provided; reject other shapes.
         if key.startswith("mk_") or key.startswith("AC-"):
             key = ""
         kwargs["moemail_api_key"] = key
         kwargs["moemail_base_url"] = ""
         kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="GPTMail API Key missing. Save sk-… from https://mail.chatgpt.org.uk/zh/api/",
+            )
     elif prov == "cfmail":
         dom = str(kwargs.get("cfmail_domain") or dom).strip()
         key = str(kwargs.get("cfmail_api_key") or kwargs.get("api_key") or kwargs.get("moemail_api_key") or "").strip()
@@ -312,6 +324,13 @@ async def start_job(
                 status_code=400,
                 detail="CF Temp Email Base URL missing.",
             )
+    elif prov == "tempmail":
+        # Free tier: no API key required. Optional Plus/Ultra Bearer key.
+        dom = str(kwargs.get("tempmail_domain") or dom).strip()
+        key = str(kwargs.get("tempmail_api_key") or kwargs.get("api_key") or "").strip()
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = ""
+        kwargs["domain"] = dom
     else:
         key = str(kwargs.get("moemail_api_key") or kwargs.get("api_key") or "").strip()
         base = str(kwargs.get("moemail_base_url") or kwargs.get("base_url") or "").strip()
@@ -338,8 +357,8 @@ async def start_job(
             )
     # Drop non-adapter kwargs
     for drop in (
-        "yyds_api_key", "gptmail_api_key", "cfmail_api_key",
-        "yyds_domain", "gptmail_domain", "cfmail_domain", "moemail_domain",
+        "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
+        "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "moemail_domain",
         "cfmail_base_url", "api_key", "base_url",
     ):
         kwargs.pop(drop, None)

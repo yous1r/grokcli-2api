@@ -38,11 +38,14 @@ window.G2A = window.G2A || {};
   let regProbedIds = new Set();
   let regProbeRunning = false;
   // Adaptive registration poll cadence + round-robin live session refresh.
-  let regPollIntervalMs = 350;
+  let regPollIntervalMs = 220;
   let regPollLiveCursor = 0;
   let regPollLastDurationMs = 0;
-  const REG_POLL_TIMEOUT_MS = 2200;
-  const REG_POLL_LIVE_REFRESH = 4; // max non-terminal sessions re-fetched per tick
+  // Hard abort per admin→Go request. Keep under Go→sidecar budget so ticks stay snappy.
+  const REG_POLL_TIMEOUT_MS = 1200;
+  // Deep session GETs are expensive; batch embed already carries log_lines.
+  // Only re-fetch 1 live session when embed has almost no timeline.
+  const REG_POLL_LIVE_REFRESH = 1;
   // Survive hard refresh: remember which batch/sessions the UI was tracking.
   const REG_TRACK_KEY = "g2a_reg_track_v1";
   let keysCache = {};
@@ -492,7 +495,9 @@ async function softNavigate(name, opts) {
         try { bindRegMailFormControls(); } catch (_) {}
         try {
           if (typeof loadRegConfig === "function") {
-            loadRegConfig(true).catch(() => {
+            // Soft-nav: do not hard-force if we just saved (avoids flash-restore).
+            const recent = regConfigCache && (Date.now() - regConfigLoadedAt) < 5000;
+            loadRegConfig(!recent).catch(() => {
               try { paintRegMailFieldsToInput(); syncRegMailProviderUI(); } catch (_) {}
             });
           } else {
@@ -1130,7 +1135,7 @@ function rebindPageControls() {
       toast(r.message || `已启动注册 ×${startedCount}（线程 ${workers}，同时最多 ${workers} 个）`);
       // Start path auto-saves on server; refresh form from DB shortly after
       setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
-      startRegPolling({ immediate: true, intervalMs: 350 });
+      startRegPolling({ immediate: true, intervalMs: 220 });
     } catch (e) { toast(e.message, false); }
     finally { if ($("btn-start-reg")) $("btn-start-reg").disabled = false; }
   });
@@ -5429,20 +5434,20 @@ function markTrackedRegistrationMissing(reason) {
 }
 
 function _desiredRegPollInterval() {
-  // Adaptive: keep logs snappy when polls are fast; back off under load so we
-  // don't pile up concurrent ticks and freeze the UI (regPollInFlight lock).
-  if (regStopping) return 700;
+  // Adaptive: snappy when polls are fast; back off only under real load so we
+  // don't pile up concurrent ticks (regPollInFlight lock freezes the log).
+  if (regStopping) return 500;
   const last = Number(regPollLastDurationMs) || 0;
-  if (last >= 1800) return 900;
-  if (last >= 1000) return 650;
-  if (last >= 500) return 450;
-  return 300;
+  if (last >= 1100) return 700;
+  if (last >= 700) return 450;
+  if (last >= 350) return 280;
+  return 180; // healthy batch-only path: ~5–6 paints/sec
 }
 
 function _scheduleRegPollTick(ms) {
   try { clearInterval(regPollTimer); } catch (_) {}
   try { clearTimeout(regPollTimer); } catch (_) {}
-  regPollIntervalMs = Math.max(250, Number(ms) || 350);
+  regPollIntervalMs = Math.max(150, Number(ms) || 220);
   // setTimeout chain (not setInterval) so a slow tick never overlaps its own
   // cadence and we can adapt the next wait to the previous duration.
   regPollTimer = setTimeout(() => {
@@ -5457,9 +5462,9 @@ function _scheduleRegPollTick(ms) {
   }, regPollIntervalMs);
 }
 
-function startRegPolling({ immediate = true, intervalMs = 350 } = {}) {
+function startRegPolling({ immediate = true, intervalMs = 220 } = {}) {
   regFinishedNotified = false;
-  regPollIntervalMs = Math.max(regStopping ? 700 : 250, Number(intervalMs) || 350);
+  regPollIntervalMs = Math.max(regStopping ? 500 : 150, Number(intervalMs) || 220);
   if (immediate) {
     // First paint ASAP; subsequent ticks use adaptive schedule.
     try { clearInterval(regPollTimer); } catch (_) {}
@@ -5586,7 +5591,7 @@ async function stopRegistration() {
     showPanel("reg-session-box");
     saveRegTrack();
     // Keep polling until cancelled/stopped, but avoid aggressive 1.2s thrash.
-    startRegPolling({ immediate: true, intervalMs: 350 });
+    startRegPolling({ immediate: true, intervalMs: 220 });
   } catch (e) {
     regStopping = false;
     toast((e && e.message) || "停止失败", false);
@@ -5598,6 +5603,10 @@ async function stopRegistration() {
 
 let regConfigCache = null;
 let regConfigLoadedAt = 0;
+// Bumps on every successful save; loadRegConfig ignores responses older than this.
+let regConfigSaveEpoch = 0;
+let regConfigLoadSeq = 0;
+let regConfigSaving = false;
 
 function syncRegCaptchaProviderUI() {
   const provider = $("reg-captcha-provider")
@@ -5615,18 +5624,20 @@ function syncRegCaptchaProviderUI() {
 
 // Per-provider mail fields: each provider has dedicated DOM inputs + DB slots.
 // Switching the dropdown only toggles visibility; values never share one input.
-const REG_MAIL_PROVIDERS = ["moemail", "yyds", "gptmail", "cfmail"];
+const REG_MAIL_PROVIDERS = ["moemail", "yyds", "gptmail", "cfmail", "tempmail"];
 const REG_MAIL_KEY_SLOTS = {
   moemail: "moemail_api_key",
   yyds: "yyds_api_key",
   gptmail: "gptmail_api_key",
   cfmail: "cfmail_api_key",
+  tempmail: "tempmail_api_key",
 };
 const REG_MAIL_DOMAIN_SLOTS = {
   moemail: "moemail_domain",
   yyds: "yyds_domain",
   gptmail: "gptmail_domain",
   cfmail: "cfmail_domain",
+  tempmail: "tempmail_domain",
 };
 const REG_MAIL_BASE_SLOTS = {
   moemail: "moemail_base_url",
@@ -5637,10 +5648,11 @@ const REG_MAIL_INPUT_IDS = {
   yyds: { key: "reg-yyds-api-key", domain: "reg-yyds-domain", base: null },
   gptmail: { key: "reg-gptmail-api-key", domain: "reg-gptmail-domain", base: null },
   cfmail: { key: "reg-cfmail-api-key", domain: "reg-cfmail-domain", base: "reg-cfmail-base-url" },
+  tempmail: { key: "reg-tempmail-api-key", domain: "reg-tempmail-domain", base: null },
 };
 // In-memory cache (mirrors dedicated inputs / DB). Empty string = cleared.
-let regMailKeys = { moemail: "", yyds: "", gptmail: "", cfmail: "" };
-let regMailDomains = { moemail: "", yyds: "", gptmail: "", cfmail: "" };
+let regMailKeys = { moemail: "", yyds: "", gptmail: "", cfmail: "", tempmail: "" };
+let regMailDomains = { moemail: "", yyds: "", gptmail: "", cfmail: "", tempmail: "" };
 let regMailBaseUrls = { moemail: "", cfmail: "" };
 let regMailProviderPrev = "moemail";
 
@@ -5651,6 +5663,7 @@ function currentRegMailProvider() {
   if (mail === "yyds") return "yyds";
   if (mail === "gptmail") return "gptmail";
   if (mail === "cfmail") return "cfmail";
+  if (mail === "tempmail" || mail === "tempmail.lol" || mail === "lol") return "tempmail";
   return "moemail";
 }
 
@@ -5663,22 +5676,42 @@ function _cleanSecretDisplay(v) {
 
 /** Pull every provider's dedicated inputs into memory (never cross-assign). */
 function stashRegMailFieldsFromInput() {
+  const active = currentRegMailProvider();
   for (const mail of REG_MAIL_PROVIDERS) {
     const ids = REG_MAIL_INPUT_IDS[mail] || {};
+    const isActive = mail === active;
+    // Key: never clobber a known secret with empty (masked display or disabled blank).
     if (ids.key && $(ids.key)) {
-      regMailKeys[mail] = $(ids.key).value || "";
+      const el = $(ids.key);
+      const v = _cleanSecretDisplay(el.value || "");
+      if (v) {
+        regMailKeys[mail] = v;
+      } else if (isActive && !el.disabled) {
+        // Visible active field intentionally cleared by user.
+        regMailKeys[mail] = "";
+      }
+      // else keep previous regMailKeys[mail]
     }
+    // Domain / base: inactive disabled empty must not wipe memory.
     if (ids.domain && $(ids.domain)) {
-      regMailDomains[mail] = $(ids.domain).value || "";
+      const el = $(ids.domain);
+      const v = el.value || "";
+      if (v || (isActive && !el.disabled)) {
+        regMailDomains[mail] = v;
+      }
     }
     if (ids.base && $(ids.base)) {
-      regMailBaseUrls[mail] = $(ids.base).value || "";
+      const el = $(ids.base);
+      const v = el.value || "";
+      if (v || (isActive && !el.disabled)) {
+        regMailBaseUrls[mail] = v;
+      }
     }
   }
   // Legacy shared inputs (if old soft-nav HTML still present) → active provider only.
-  const active = currentRegMailProvider();
   if ($("reg-api-key") && !$("reg-moemail-api-key")) {
-    regMailKeys[active] = $("reg-api-key").value || "";
+    const v = _cleanSecretDisplay($("reg-api-key").value || "");
+    if (v || $("reg-api-key").value === "") regMailKeys[active] = v;
   }
   if ($("reg-domain") && !$("reg-moemail-domain")) {
     regMailDomains[active] = $("reg-domain").value || "";
@@ -5712,9 +5745,10 @@ function regMailProviderMeta(mail) {
   const m = mail || "moemail";
   const table = {
     moemail: { title: "MoeMail", help: "", temp24h: false },
-    yyds: { title: "YYDS Mail", help: "", temp24h: true },
-    gptmail: { title: "GPTMail", help: "", temp24h: true },
-    cfmail: { title: "Cloudflare Temp Email", help: "", temp24h: false },
+    yyds: { title: "YYDS Mail", help: "X-API-Key: AC-… · https://maliapi.215.im/v1 · 文档 vip.215.im/docs", temp24h: true },
+    gptmail: { title: "GPTMail", help: "X-API-Key: sk-… · https://mail.chatgpt.org.uk/zh/api/", temp24h: true },
+    cfmail: { title: "Cloudflare Temp Email", help: "Worker API + ADMIN_PASSWORDS(x-admin-auth) · github.com/dreamhunter2333/cloudflare_temp_email", temp24h: false },
+    tempmail: { title: "TempMail.lol", help: "免费无需 Key · api.tempmail.lol · 文档 tempmail.lol/zh/api", temp24h: true },
   };
   return table[m] || table.moemail;
 }
@@ -5835,10 +5869,11 @@ if (!window.__g2aRegMailDelegated) {
           syncRegMailProviderUI({ toast: true });
           clearTimeout(window.__g2aRegMailSaveT);
           window.__g2aRegMailSaveT = setTimeout(() => {
+            if (regConfigSaving) return;
             if (typeof saveRegConfig === "function") {
               saveRegConfig().catch((err) => console.warn("auto-save reg mail config", err));
             }
-          }, 350);
+          }, 600);
         } catch (err) {
           console.warn("reg-mail-provider change", err);
         }
@@ -5879,13 +5914,16 @@ function readRegConfig() {
     yyds_domain: regMailDomains.yyds || "",
     gptmail_domain: regMailDomains.gptmail || "",
     cfmail_domain: regMailDomains.cfmail || "",
+    tempmail_domain: regMailDomains.tempmail || "",
     expiry_ms: $("reg-expiry-ms") ? $("reg-expiry-ms").value.trim() : "",
-    // Active key + all per-provider keys (empty keeps previous secret server-side on save).
+    // Active key + all per-provider keys (empty keeps previous secret server-side on save,
+    // except TempMail.lol free tier which intentionally uses empty key/domain).
     api_key: activeKey,
     moemail_api_key: regMailKeys.moemail || "",
     yyds_api_key: regMailKeys.yyds || "",
     gptmail_api_key: regMailKeys.gptmail || "",
     cfmail_api_key: regMailKeys.cfmail || "",
+    tempmail_api_key: regMailKeys.tempmail || "",
     captcha_provider: isLocal ? "local" : "yescaptcha",
     // Inline local solver is fixed; do not accept/show custom URL.
     local_solver_url: isLocal ? "http://127.0.0.1:5072" : "",
@@ -5932,33 +5970,63 @@ function normalizeRegExpiryMs(value) {
 function applyRegConfig(cfg) {
   if (!cfg || typeof cfg !== "object") return;
   const mail = String(cfg.mail_provider || cfg.provider || "moemail").trim().toLowerCase();
-  const mailProv = mail === "yyds" ? "yyds" : mail === "gptmail" ? "gptmail" : mail === "cfmail" ? "cfmail" : "moemail";
+  const mailProv = mail === "yyds" ? "yyds" : mail === "gptmail" ? "gptmail" : mail === "cfmail" ? "cfmail" : mail === "tempmail" ? "tempmail" : "moemail";
   if ($("reg-mail-provider")) {
     $("reg-mail-provider").value = mailProv;
   }
   // Hydrate per-provider key/domain caches.
   // Prefer dedicated fields; only fall back to active field for the *current*
   // provider. Never invent values for other providers.
-  const activeKey = cfg.api_key == null ? "" : String(cfg.api_key);
-  const activeDomain = cfg.domain == null ? "" : String(cfg.domain);
-  regMailKeys = {
-    moemail:
-      cfg.moemail_api_key != null && cfg.moemail_api_key !== ""
-        ? String(cfg.moemail_api_key)
-        : (mailProv === "moemail" ? activeKey : (regMailKeys.moemail || "")),
-    yyds:
-      cfg.yyds_api_key != null && cfg.yyds_api_key !== ""
-        ? String(cfg.yyds_api_key)
-        : (mailProv === "yyds" ? activeKey : (regMailKeys.yyds || "")),
-    gptmail:
-      cfg.gptmail_api_key != null && cfg.gptmail_api_key !== ""
-        ? String(cfg.gptmail_api_key)
-        : (mailProv === "gptmail" ? activeKey : (regMailKeys.gptmail || "")),
-    cfmail:
-      cfg.cfmail_api_key != null && cfg.cfmail_api_key !== ""
-        ? String(cfg.cfmail_api_key)
-        : (mailProv === "cfmail" ? activeKey : (regMailKeys.cfmail || "")),
+  const cleanKey = (v) => {
+    const s = v == null ? "" : String(v);
+    if (!s) return "";
+    // Masked server secrets are not usable — keep previous memory instead.
+    if (s.indexOf("…") >= 0 || s.indexOf("...") >= 0 || /^\*+$/.test(s) || s === "****") return "";
+    return s;
   };
+  const activeKey = cleanKey(cfg.api_key);
+  const activeDomain = cfg.domain == null ? "" : String(cfg.domain);
+  // Keys: dedicated DB slot always wins when the field is present.
+  // - non-empty / unmasked → use it
+  // - empty string + *_set false (or dedicated field present as "") → cleared, do NOT restore prev
+  // - masked / missing → keep previous UI memory
+  const pickKey = (slotVal, isActive, prev, setFlag) => {
+    if (slotVal != null && String(slotVal) !== "") {
+      const slot = cleanKey(slotVal);
+      if (slot) return slot;
+      // Masked secret: keep previous memory (do not wipe just-saved key).
+      return prev || "";
+    }
+    // Explicit empty from server: honor clear for this provider slot.
+    // setFlag === false means "no secret stored"; true+empty is masked-as-empty edge.
+    if (slotVal === "" || setFlag === false) {
+      return "";
+    }
+    if (isActive && activeKey) return activeKey;
+    return prev || "";
+  };
+  regMailKeys = {
+    moemail: pickKey(cfg.moemail_api_key, mailProv === "moemail", regMailKeys.moemail || "", cfg.moemail_api_key_set),
+    yyds: pickKey(cfg.yyds_api_key, mailProv === "yyds", regMailKeys.yyds || "", cfg.yyds_api_key_set),
+    gptmail: pickKey(cfg.gptmail_api_key, mailProv === "gptmail", regMailKeys.gptmail || "", cfg.gptmail_api_key_set),
+    cfmail: pickKey(cfg.cfmail_api_key, mailProv === "cfmail", regMailKeys.cfmail || "", cfg.cfmail_api_key_set),
+    tempmail: pickKey(cfg.tempmail_api_key, mailProv === "tempmail", regMailKeys.tempmail || "", cfg.tempmail_api_key_set),
+  };
+  // Dedicated DB slots always win when present (independent of active provider).
+  // Empty string clears that provider only — never restore from prev/local cache.
+  for (const [prov, slot] of Object.entries(REG_MAIL_KEY_SLOTS || {})) {
+    if (!Object.prototype.hasOwnProperty.call(cfg, slot)) continue;
+    const raw = cfg[slot];
+    const setFlag = cfg[slot + "_set"];
+    if (raw == null || raw === "") {
+      // Explicit empty / not set → clear this provider's key only.
+      if (setFlag === false || raw === "") regMailKeys[prov] = "";
+      continue;
+    }
+    const cleaned = cleanKey(raw);
+    if (cleaned) regMailKeys[prov] = cleaned;
+    // Masked: leave existing regMailKeys[prov] (from pickKey prev).
+  }
   // Domain: if the dedicated field is present (including empty string from server),
   // honor it. Empty means cleared — do not restore from cache/localStorage.
   const pickDomain = (slotKey, isActive) => {
@@ -5975,6 +6043,7 @@ function applyRegConfig(cfg) {
     yyds: pickDomain("yyds_domain", mailProv === "yyds"),
     gptmail: pickDomain("gptmail_domain", mailProv === "gptmail"),
     cfmail: pickDomain("cfmail_domain", mailProv === "cfmail"),
+    tempmail: pickDomain("tempmail_domain", mailProv === "tempmail"),
   };
   // If server returned empty dedicated slot for active provider, force empty.
   if (mailProv === "yyds" && Object.prototype.hasOwnProperty.call(cfg, "yyds_domain")) {
@@ -5985,6 +6054,9 @@ function applyRegConfig(cfg) {
   }
   if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_domain")) {
     regMailDomains.cfmail = cfg.cfmail_domain == null ? "" : String(cfg.cfmail_domain);
+  }
+  if (mailProv === "tempmail" && Object.prototype.hasOwnProperty.call(cfg, "tempmail_domain")) {
+    regMailDomains.tempmail = cfg.tempmail_domain == null ? "" : String(cfg.tempmail_domain);
   }
   if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")) {
     regMailDomains.moemail = cfg.moemail_domain == null ? "" : String(cfg.moemail_domain);
@@ -6058,11 +6130,17 @@ async function saveRegConfig() {
   // Do NOT cache the pre-save form first — if the user cleared domain/key,
   // caching here would let a later loadRegConfigLocal() restore the old value
   // before the server response lands.
+  const saveEpoch = ++regConfigSaveEpoch;
+  regConfigSaving = true;
   try {
     const r = await api("/accounts/register-email/config", {
       method: "PUT",
       body: JSON.stringify(cfg),
     });
+    if (saveEpoch !== regConfigSaveEpoch) {
+      // A newer save started; ignore this response for paint.
+      return (r && r.config) || cfg;
+    }
     const saved = (r && r.config) || cfg;
     // Force active provider domain/key from what we just submitted when server
     // omits empty strings, so UI stays cleared.
@@ -6070,32 +6148,106 @@ async function saveRegConfig() {
     // Always keep every provider's dedicated slots (key/domain/base) so a save
     // for one service never blanks another in the UI.
     for (const k of [
-      "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key",
-      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain",
+      "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
+      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
       "moemail_base_url", "cfmail_base_url", "domain", "api_key", "base_url",
     ]) {
       if (!Object.prototype.hasOwnProperty.call(saved, k)) {
         saved[k] = cfg[k] != null ? cfg[k] : "";
       }
     }
+    // Submitted empty secrets/domains must win over masked/stale server echoes
+    // so "delete + save" does not restore the previous value.
+    for (const k of [
+      "tempmail_api_key", "tempmail_domain",
+      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain",
+      "moemail_base_url", "cfmail_base_url",
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(cfg, k)) {
+        const submitted = cfg[k] == null ? "" : String(cfg[k]);
+        // Empty submit → force empty on paint (independent per-provider slot).
+        if (submitted === "") saved[k] = "";
+        else if (k.endsWith("_api_key")) {
+          // Non-empty key: prefer plain submitted over masked server value.
+          const echo = saved[k] == null ? "" : String(saved[k]);
+          if (!echo || echo.indexOf("…") >= 0 || echo.indexOf("...") >= 0 || /^\*+$/.test(echo)) {
+            saved[k] = submitted;
+          }
+        } else {
+          saved[k] = submitted;
+        }
+      }
+    }
     // Active mirrors for the selected provider (adapter-facing).
     if (mail === "yyds") {
-      if (!saved.domain) saved.domain = saved.yyds_domain || cfg.domain || "";
-      if (!saved.api_key) saved.api_key = saved.yyds_api_key || cfg.api_key || "";
+      saved.domain = Object.prototype.hasOwnProperty.call(cfg, "yyds_domain")
+        ? (cfg.yyds_domain || "")
+        : (saved.yyds_domain || saved.domain || "");
+      saved.api_key = Object.prototype.hasOwnProperty.call(cfg, "yyds_api_key")
+        ? (cfg.yyds_api_key || "")
+        : (saved.yyds_api_key || saved.api_key || "");
     } else if (mail === "gptmail") {
-      if (!saved.domain) saved.domain = saved.gptmail_domain || cfg.domain || "";
-      if (!saved.api_key) saved.api_key = saved.gptmail_api_key || cfg.api_key || "";
+      saved.domain = Object.prototype.hasOwnProperty.call(cfg, "gptmail_domain")
+        ? (cfg.gptmail_domain || "")
+        : (saved.gptmail_domain || saved.domain || "");
+      saved.api_key = Object.prototype.hasOwnProperty.call(cfg, "gptmail_api_key")
+        ? (cfg.gptmail_api_key || "")
+        : (saved.gptmail_api_key || saved.api_key || "");
     } else if (mail === "cfmail") {
-      if (!saved.domain) saved.domain = saved.cfmail_domain || cfg.domain || "";
-      if (!saved.api_key) saved.api_key = saved.cfmail_api_key || cfg.api_key || "";
+      saved.domain = Object.prototype.hasOwnProperty.call(cfg, "cfmail_domain")
+        ? (cfg.cfmail_domain || "")
+        : (saved.cfmail_domain || saved.domain || "");
+      saved.api_key = Object.prototype.hasOwnProperty.call(cfg, "cfmail_api_key")
+        ? (cfg.cfmail_api_key || "")
+        : (saved.cfmail_api_key || saved.api_key || "");
       if (!saved.base_url) saved.base_url = saved.cfmail_base_url || cfg.base_url || "";
+    } else if (mail === "tempmail") {
+      // Free tier defaults: empty key + empty domain; never rehydrate from other providers.
+      saved.tempmail_domain = Object.prototype.hasOwnProperty.call(cfg, "tempmail_domain")
+        ? (cfg.tempmail_domain == null ? "" : String(cfg.tempmail_domain))
+        : (saved.tempmail_domain || "");
+      saved.tempmail_api_key = Object.prototype.hasOwnProperty.call(cfg, "tempmail_api_key")
+        ? (cfg.tempmail_api_key == null ? "" : String(cfg.tempmail_api_key))
+        : (saved.tempmail_api_key || "");
+      saved.domain = saved.tempmail_domain;
+      saved.api_key = saved.tempmail_api_key;
+      saved.base_url = "";
     } else {
-      if (!saved.domain) saved.domain = saved.moemail_domain || cfg.domain || "";
-      if (!saved.api_key) saved.api_key = saved.moemail_api_key || cfg.api_key || "";
+      saved.domain = Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")
+        ? (cfg.moemail_domain || "")
+        : (saved.moemail_domain || saved.domain || "");
+      saved.api_key = Object.prototype.hasOwnProperty.call(cfg, "moemail_api_key")
+        ? (cfg.moemail_api_key || "")
+        : (saved.moemail_api_key || saved.api_key || "");
       if (!saved.base_url) saved.base_url = saved.moemail_base_url || cfg.base_url || "";
+    }
+    // Prefer form values for non-secret fields when server echoes stale/default.
+    // Secrets: keep clean submitted keys if server returns masked.
+    for (const k of ["count", "concurrency", "stagger_ms", "probe_delay_sec", "proxy",
+      "proxy_username", "proxy_strategy", "captcha_provider", "expiry_ms",
+      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
+      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "mail_provider"]) {
+      if (Object.prototype.hasOwnProperty.call(cfg, k) && cfg[k] != null && cfg[k] !== "") {
+        // Keep user-submitted value authoritative after save.
+        if (saved[k] == null || saved[k] === "" || String(saved[k]) !== String(cfg[k])) {
+          // Only override when cfg had a concrete value for this save.
+          if (cfg[k] !== "" || Object.prototype.hasOwnProperty.call(cfg, k)) {
+            saved[k] = cfg[k];
+          }
+        }
+      }
+    }
+    // Always pin numeric fields from the form we just saved.
+    for (const k of ["count", "concurrency", "stagger_ms", "probe_delay_sec"]) {
+      if (cfg[k] != null && cfg[k] !== "") saved[k] = cfg[k];
+    }
+    for (const k of ["moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
+      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "proxy", "proxy_username", "proxy_strategy"]) {
+      if (Object.prototype.hasOwnProperty.call(cfg, k)) saved[k] = cfg[k];
     }
     applyRegConfig(saved);
     cacheRegConfigLocal(saved);
+    regConfigCache = Object.assign({}, saved);
     regConfigLoadedAt = Date.now();
     const pname = (regMailProviderMeta(mail) || {}).title || mail;
     toast(r.message || `已保存「${pname}」及全部邮箱配置到数据库`);
@@ -6105,6 +6257,8 @@ async function saveRegConfig() {
     cacheRegConfigLocal(cfg);
     toast((e && e.message) || "保存失败（已写本地缓存）", false);
     throw e;
+  } finally {
+    if (saveEpoch === regConfigSaveEpoch) regConfigSaving = false;
   }
 }
 
@@ -6117,22 +6271,36 @@ function loadRegConfigLocal() {
 async function loadRegConfig(force) {
   // Prefer server/DB truth. Local cache is only a first-paint fallback when we
   // have nothing yet — never let it overwrite a just-cleared domain/key.
-  // Always re-fetch when forced, or when cache is older than 2s (multi-worker
-  // saves must not stick on a stale browser/page session forever).
-  if (!force && !regConfigCache) loadRegConfigLocal();
+  // Skip remote reload while a save is in flight or just finished (3s grace)
+  // so soft-nav / auto-refresh cannot "还原" the form to a pre-save snapshot.
   const now = Date.now();
+  if (regConfigSaving || (regConfigLoadedAt && now - regConfigLoadedAt < 3000 && regConfigCache)) {
+    if (regConfigCache) {
+      applyRegConfig(regConfigCache);
+      return regConfigCache;
+    }
+  }
+  if (!force && !regConfigCache) loadRegConfigLocal();
   if (!force && regConfigCache && now - regConfigLoadedAt < 2000) {
     applyRegConfig(regConfigCache);
     return regConfigCache;
   }
+  const loadSeq = ++regConfigLoadSeq;
+  const saveEpochAtStart = regConfigSaveEpoch;
   try {
     const r = await api("/accounts/register-email/config");
+    // Ignore if a save happened while we were fetching, or a newer load started.
+    if (loadSeq !== regConfigLoadSeq || saveEpochAtStart !== regConfigSaveEpoch) {
+      return regConfigCache;
+    }
+    if (regConfigSaving) {
+      return regConfigCache;
+    }
     const cfg = (r && r.config) || null;
     if (cfg) {
       applyRegConfig(cfg);
       cacheRegConfigLocal(cfg);
       regConfigLoadedAt = Date.now();
-      // Expose source for debugging in console when not from database.
       if (r && r.source && r.source !== "database") {
         console.info("registration_config source=", r.source);
       }
@@ -6165,10 +6333,12 @@ function buildRegBody(config) {
         ? "gptmail"
         : mailProvider === "cfmail"
           ? "cfmail"
-          : "moemail";
+          : mailProvider === "tempmail" || mailProvider === "tempmail.lol" || mailProvider === "lol"
+            ? "tempmail"
+            : "moemail";
   // Keep legacy field for older backends.
   body.provider = body.mail_provider;
-  // MoeMail + CF Temp Email need base_url; YYDS/GPTMail use fixed hosts.
+  // MoeMail + CF Temp Email need base_url; YYDS/GPTMail/TempMail.lol use fixed hosts.
   // Always send dedicated host slots (including empty) so saves stay isolated.
   body.moemail_base_url = config.moemail_base_url == null ? "" : String(config.moemail_base_url);
   body.cfmail_base_url = config.cfmail_base_url == null ? "" : String(config.cfmail_base_url);
@@ -6182,16 +6352,19 @@ function buildRegBody(config) {
   // Always send domain for the active provider (empty clears/auto).
   body.domain = config.domain == null ? "" : String(config.domain);
   // Always send an official MoeMail preset (including permanent=0).
-  // YYDS / GPTMail are ~24h; still send 1d when selected.
+  // YYDS / GPTMail / TempMail.lol are ~24h; still send 1d when selected.
   body.expiry_ms = Number.parseInt(normalizeRegExpiryMs(config.expiry_ms), 10);
   if (
-    (body.mail_provider === "yyds" || body.mail_provider === "gptmail") &&
+    (body.mail_provider === "yyds" ||
+      body.mail_provider === "gptmail" ||
+      body.mail_provider === "tempmail") &&
     (body.expiry_ms === 0 || body.expiry_ms === 259200000)
   ) {
     body.expiry_ms = 86400000;
   }
   // Always send active key/domain, including empty string, so "delete + save"
   // clears DB instead of restoring the previous value.
+  // TempMail.lol free: empty api_key + empty domain is valid (system random domain).
   body.api_key = config.api_key == null ? "" : String(config.api_key);
   if (body.mail_provider === "moemail") {
     body.moemail_api_key = config.moemail_api_key == null ? body.api_key : String(config.moemail_api_key);
@@ -6226,6 +6399,18 @@ function buildRegBody(config) {
     body.cfmail_base_url = cfBase;
     body.moemail_base_url = cfBase;
     body.base_url = cfBase;
+  } else if (body.mail_provider === "tempmail") {
+    // Free tier: empty key + empty domain (api.tempmail.lol random inbox).
+    // Plus/Ultra: optional Bearer key + optional custom domain.
+    body.tempmail_api_key =
+      config.tempmail_api_key == null ? (body.api_key || "") : String(config.tempmail_api_key || "");
+    body.tempmail_domain =
+      config.tempmail_domain == null ? (body.domain || "") : String(config.tempmail_domain || "");
+    body.domain = body.tempmail_domain;
+    body.moemail_api_key = body.tempmail_api_key;
+    body.api_key = body.tempmail_api_key;
+    body.moemail_base_url = "";
+    body.base_url = "";
   }
   const provider = String(config.captcha_provider || "local").trim().toLowerCase();
   body.captcha_provider = provider === "yescaptcha" ? "yescaptcha" : "local";
@@ -6433,7 +6618,7 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
   // Live task only.
   regFinishedNotified = false;
   if (continuePolling) {
-    startRegPolling({ immediate: true, intervalMs: 350 });
+    startRegPolling({ immediate: true, intervalMs: 220 });
   }
   saveRegTrack();
   return true;
@@ -7027,33 +7212,27 @@ async function pollRegSession() {
     if (batch && Array.isArray(batch.sessions) && batch.sessions.length) {
       sessions = batch.sessions.slice();
       sessionHits = sessions.length;
-      // Batch embed already has log_lines. Only re-fetch a small round-robin
-      // window of live sessions when their log_lines are empty/stale — this was
-      // the main source of multi-second poll lag (was 12 parallel session GETs).
-      const liveAll = sessions
+      // Batch embed already includes log_lines (adapter keeps last 20). Prefer
+      // zero extra session GETs — deep-fetch only when embed has no timeline yet
+      // (first 1–2s of a new session). Cap at REG_POLL_LIVE_REFRESH (=1).
+      const needDeep = sessions
         .filter((s) => {
           const st = regStatusOf(s);
-          return !(REG_TERMINAL_OK.has(st) || REG_TERMINAL_BAD.has(st));
+          if (REG_TERMINAL_OK.has(st) || REG_TERMINAL_BAD.has(st)) return false;
+          const logs = Array.isArray(s.log_lines) ? s.log_lines : [];
+          // Only when completely bare (no steps yet).
+          return logs.length < 1;
         })
         .map((s) => regSessionKey(s))
         .filter(Boolean);
-      const needDeep = liveAll.filter((id) => {
-        const s = sessions.find((x) => regSessionKey(x) === id);
-        if (!s) return true;
-        const logs = Array.isArray(s.log_lines) ? s.log_lines : [];
-        // Deep-fetch when embed has no timeline yet, or status is mid-step.
-        return logs.length < 2;
-      });
-      // Round-robin across live ids so every worker gets occasional deep refresh.
-      const pool = needDeep.length ? needDeep : liveAll;
-      const n = Math.min(REG_POLL_LIVE_REFRESH, pool.length);
+      const n = Math.min(REG_POLL_LIVE_REFRESH, needDeep.length);
       const liveIds = [];
       if (n > 0) {
-        const start = regPollLiveCursor % pool.length;
+        const start = regPollLiveCursor % needDeep.length;
         for (let i = 0; i < n; i++) {
-          liveIds.push(pool[(start + i) % pool.length]);
+          liveIds.push(needDeep[(start + i) % needDeep.length]);
         }
-        regPollLiveCursor = (start + n) % Math.max(1, pool.length);
+        regPollLiveCursor = (start + n) % Math.max(1, needDeep.length);
       }
       if (liveIds.length) {
         const fresh = await Promise.all(
@@ -7077,7 +7256,6 @@ async function pollRegSession() {
             const prev = byId.get(id) || {};
             const prevTs = Number(prev.updated_at || 0) || 0;
             const nextTs = Number(r.data.updated_at || 0) || 0;
-            // Prefer fresher snapshot; also take longer log_lines even if ts ties.
             const prevLogs = Array.isArray(prev.log_lines) ? prev.log_lines.length : 0;
             const nextLogs = Array.isArray(r.data.log_lines) ? r.data.log_lines.length : 0;
             if (nextTs >= prevTs || nextLogs > prevLogs) {
@@ -7091,8 +7269,8 @@ async function pollRegSession() {
         sessionHits = sessions.length;
       }
     } else {
-      // No batch embed: parallel-fetch a small window (hard cap keeps tick < ~1s).
-      const fetchIds = ids.slice(0, 8);
+      // No batch embed: parallel-fetch a small window (hard cap keeps tick < ~0.6s).
+      const fetchIds = ids.slice(0, 4);
       const results = await Promise.all(
         fetchIds.map(async (id) => {
           try {
@@ -7121,19 +7299,22 @@ async function pollRegSession() {
     // Skip this extra list call when the batch payload already has sessions —
     // it was the main source of 2–4s poll lag under multi-worker load.
     let listHasTrackedBatch = false;
-    // Prefer batch payload; only sweep /sessions when batch is incomplete by a
-    // meaningful margin (avoids multi-second list lag every tick).
+    // Prefer batch payload; only sweep /sessions when batch is far incomplete.
+    // Spawning lag of a few sessions is fine — next batch poll will catch up.
     const needListSweep = (() => {
       if (!batch) return ids.length === 0 || sessionHits === 0;
       if (!Array.isArray(batch.sessions) || !batch.sessions.length) {
-        // Spawning: allow one sweep so late session_ids appear.
-        return Number(batch.spawned || batch.session_ids && batch.session_ids.length || 0) > 0
-          || Number(batch.count || 0) > 0;
+        // Only during early spawn when we have zero sessions yet.
+        return sessionHits === 0 && (
+          Number(batch.spawned || 0) > 0
+          || (Array.isArray(batch.session_ids) && batch.session_ids.length > 0)
+          || Number(batch.count || 0) > 0
+        );
       }
       const want = Array.isArray(batch.session_ids) ? batch.session_ids.length : 0;
       if (want <= 0) return false;
-      // tolerate spawn lag; sweep only when far behind
-      return batch.sessions.length + 4 < want;
+      // Only when dramatically behind (e.g. embed window truncated vs total).
+      return batch.sessions.length + 12 < want;
     })();
     if (needListSweep) try {
       const all = await regApi("/accounts/register-email/sessions");
@@ -9931,7 +10112,7 @@ if ($("btn-start-reg")) {
         }
         saveRegTrack();
         setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
-        startRegPolling({ immediate: true, intervalMs: 350 });
+        startRegPolling({ immediate: true, intervalMs: 220 });
         if (r.batch_id) {
           setTimeout(async () => {
             try {

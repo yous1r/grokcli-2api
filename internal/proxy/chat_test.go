@@ -505,7 +505,7 @@ func TestGuardStreamAgainstEmptyDoesNotDualRead(t *testing.T) {
 	go func() {
 		// Hollow keepalive-like frames first (usage-only / empty delta), then content.
 		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{}}]}\n\n"))
-		time.Sleep(emptyStreamPeekBudget + 30*time.Millisecond)
+		time.Sleep(emptyStreamNoDataBudget + 30*time.Millisecond)
 		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"after-budget\"}}]}\n\ndata: [DONE]\n\n"))
 		_ = pw.Close()
 	}()
@@ -908,5 +908,89 @@ func TestChatToolAssemblerSoftWriteRequeue(t *testing.T) {
 	}
 	if second := a.FinishReasonFrame(); second != nil {
 		t.Fatalf("idempotent FinishReasonFrame, got %#v", second)
+	}
+}
+
+func TestGuardStreamAgainstEmptyHollowThenDone(t *testing.T) {
+	// Hollow drips (empty delta) then [DONE] within hollow budget must be empty
+	// so OpenStream can failover before Anthropic message_start opens.
+	// This is the intermittent Claude Code high-effort empty-output path.
+	pr, pw := io.Pipe()
+	go func() {
+		// Immediate hollow frame (activity → hollow path, not pure silence).
+		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1}}\n\n"))
+		time.Sleep(200 * time.Millisecond)
+		_, _ = pw.Write([]byte("data: [DONE]\n\n"))
+		_ = pw.Close()
+	}()
+	guarded, empty, err := guardStreamAgainstEmpty(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty {
+		t.Fatalf("hollow-then-done must be empty for failover, guarded=%v", guarded != nil)
+	}
+	if guarded != nil {
+		_ = guarded.Close()
+	}
+}
+
+func TestGuardStreamAgainstEmptyHollowThenContentIsLive(t *testing.T) {
+	// Hollow keepalive then real content within hollow budget must stay live.
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{}}]}\n\n"))
+		time.Sleep(150 * time.Millisecond)
+		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
+		_ = pw.Close()
+	}()
+	guarded, empty, err := guardStreamAgainstEmpty(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty {
+		t.Fatal("hollow then content must be live")
+	}
+	defer guarded.Close()
+	var got strings.Builder
+	if err := grok.ReadSSE(guarded, func(event grok.Event) error {
+		if !event.Done {
+			got.Write(event.Data)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got.String(), "hi") {
+		t.Fatalf("content lost: %q", got.String())
+	}
+}
+
+func TestGuardStreamAgainstEmptySilenceThenDone(t *testing.T) {
+	// Pure silence then [DONE] within abs budget must be empty (failover).
+	// Matches Claude high-effort hollow empties that never send a model delta.
+	pr, pw := io.Pipe()
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+		_ = pw.Close()
+	}()
+	// Cap abs budget for test speed via short-circuit: we can't override const,
+	// so 800ms silence+done is well under 15s and must return empty.
+	started := time.Now()
+	guarded, empty, err := guardStreamAgainstEmpty(pr)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty {
+		t.Fatalf("silence-then-done must be empty for failover (elapsed=%v)", elapsed)
+	}
+	if guarded != nil {
+		_ = guarded.Close()
+	}
+	// Should resolve near the 800ms write, not wait full 15s.
+	if elapsed > 5*time.Second {
+		t.Fatalf("took too long %v (should resolve soon after DONE)", elapsed)
 	}
 }
